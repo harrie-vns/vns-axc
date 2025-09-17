@@ -1,196 +1,207 @@
 // netlify/functions/add-contact-note.js
 import crypto from "crypto";
 
-const log = (...a) => console.log("[add-contact-note]", ...a);
-
-// --- signature verification (ThriveDesk: HMAC-SHA1 BASE64 over JSON.stringify(data)) ---
-function computeSignature(secret, dataObj) {
-  const h = crypto.createHmac("sha1", secret);
-  h.update(JSON.stringify(dataObj));
-  return h.digest("base64");
+// ---- helpers ----
+function tdSignature(secret, dataObj) {
+  // ThriveDesk: base64(HMAC-SHA1(JSON.stringify(data))) using the webhook secret
+  // (sign ONLY the `data` field) — see docs. 
+  return crypto.createHmac("sha1", secret)
+    .update(JSON.stringify(dataObj))
+    .digest("base64");
 }
 
-function signatureOk(headerValue, secret, payload) {
-  if (!secret) return true; // no secret set = skip
-  if (!headerValue) return false;
-  const expected = computeSignature(secret, payload?.data ?? payload);
-  // Simple string compare (avoids timingSafeEqual length errors seen earlier)
-  return headerValue === expected;
+function pickContactEmail(data) {
+  // Docs sometimes say contactInfo, the sample shows contact.
+  return data?.contact?.email || data?.contactInfo?.email || null;
 }
 
-// --- tiny helper: HTML -> plain text for notes ---
-function htmlToText(html) {
-  if (!html) return "";
-  return String(html)
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/p>/gi, "\n\n")
-    .replace(/<style[\s\S]*?<\/style>|<script[\s\S]*?<\/script>/gi, "")
-    .replace(/<[^>]+>/g, "")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">");
+function latestOutboundEmailThread(data) {
+  const threads = Array.isArray(data?.threads) ? data.threads : [];
+  const candidates = threads.filter(t =>
+    (t.type === "Email") && (t.direction === "Outbound")
+  );
+  candidates.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  return candidates[0] || null;
 }
 
-const AXC = {
-  base: process.env.AXC_BASE_URL?.replace(/\/+$/, ""),
-  apitoken: process.env.AXC_API_TOKEN,
-  wstoken: process.env.AXC_WS_TOKEN,
-};
-
-async function axcFetch(path, opts = {}) {
-  const url = `${AXC.base}${path}`;
-  const headers = {
-    apitoken: AXC.apitoken,
-    wstoken: AXC.wstoken,
-    ...(opts.headers || {}),
-  };
-  const res = await fetch(url, { ...opts, headers });
+async function axcFetch(base, path, headers, init = {}) {
+  const url = `${base.replace(/\/$/, "")}${path}`;
+  const res = await fetch(url, {
+    ...init,
+    headers: {
+      "Content-Type": "application/json",
+      ...headers,
+      ...(init.headers || {}),
+    },
+  });
   const text = await res.text();
   let body;
   try { body = text ? JSON.parse(text) : null; } catch { body = text; }
-  return { ok: res.ok, status: res.status, body };
+  return { ok: res.ok, status: res.status, body, url };
 }
 
-async function findContactByEmail(email) {
-  // Use /contacts/search and pick the best exact match
-  const q = encodeURIComponent(email);
-  const { ok, body } = await axcFetch(`/api/contacts/search?search=${q}&displayLength=100`, { method: "GET" });
-  if (!ok || !Array.isArray(body) || body.length === 0) return null;
+function makeNote({ data, outbound, subjectPrefix = "ThriveDesk Email" }) {
+  const subj = data?.subject ? `${data.subject}` : "(no subject)";
+  const bodyTxt = outbound?.textBody || "";
+  const bodyHtml = outbound?.htmlBody || "";
 
-  const lower = email.toLowerCase();
-  const exact = body.find(
-    c =>
-      (c.EMAILADDRESS && c.EMAILADDRESS.toLowerCase() === lower) ||
-      (c.EMAILADDRESSALTERNATIVE && c.EMAILADDRESSALTERNATIVE.toLowerCase() === lower) ||
-      (c.CUSTOMFIELD_PERSONALEMAIL && c.CUSTOMFIELD_PERSONALEMAIL.toLowerCase() === lower)
-  );
-  return exact || (body.length === 1 ? body[0] : null);
+  const stamp = new Date().toISOString();
+  let note = `📧 ${subjectPrefix}\nTicket #${data?.ticketId ?? "-"}  •  ${stamp}\n`;
+  note += `To: ${data?.contact?.email || data?.contactInfo?.email || "-"}\n`;
+  note += `Subject: ${subj}\n\n`;
+
+  if (bodyTxt) {
+    note += `--- TEXT ---\n${bodyTxt}\n`;
+  } else if (bodyHtml) {
+    // Simple HTML to text fallback (very basic)
+    note += `--- HTML ---\n${bodyHtml.replace(/<[^>]+>/g, "").trim()}\n`;
+  } else if (data?.excerpt) {
+    note += `--- EXCERPT ---\n${data.excerpt}\n`;
+  } else {
+    note += `(no body)\n`;
+  }
+  return note.slice(0, 60000); // safety: keep it sane
 }
 
-async function addContactNote(contactID, noteText) {
-  // aXcelerate prefers form-encoded for this endpoint
-  const form = new URLSearchParams();
-  form.set("contactID", String(contactID));
-  form.set("contactNote", noteText);
-  // Intentionally NOT sending noteTypeID per your finding (defaults to System Note)
-  return axcFetch("/api/contact/note/", {
-    method: "PUT",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: form.toString(),
-  });
-}
-
+// ---- handler ----
 export const handler = async (event) => {
+  const log = (...args) => console.log("[add-contact-note]", ...args);
+
+  const {
+    AXC_BASE_URL,
+    AXC_API_TOKEN,
+    AXC_WS_TOKEN,
+    THRIVEDESK_SECRET,
+  } = process.env;
+
+  if (!AXC_BASE_URL || !AXC_API_TOKEN || !AXC_WS_TOKEN || !THRIVEDESK_SECRET) {
+    return {
+      statusCode: 500,
+      body: JSON.stringify({ error: "Missing env vars" }),
+    };
+  }
+
+  if (event.httpMethod !== "POST") {
+    return {
+      statusCode: 405,
+      body: JSON.stringify({ error: "Use POST with JSON" }),
+    };
+  }
+
+  // Parse JSON
+  let payload;
   try {
-    if (event.httpMethod !== "POST") {
-      return { statusCode: 405, body: JSON.stringify({ error: "Use POST with JSON" }) };
+    payload = JSON.parse(event.body || "{}");
+  } catch (e) {
+    log("bad json", e?.message);
+    return { statusCode: 400, body: JSON.stringify({ error: "Bad JSON" }) };
+  }
+
+  const sigHeader = event.headers["x-td-signature"] || event.headers["X-TD-Signature"] || "";
+  const dataObj = payload?.data;
+  if (!dataObj) {
+    log("no data field in payload");
+    return { statusCode: 400, body: JSON.stringify({ error: "Missing data" }) };
+  }
+
+  // Verify signature: ONLY the data object (per docs)
+  try {
+    const computed = tdSignature(THRIVEDESK_SECRET, dataObj);
+    if (sigHeader !== computed) {
+      log("signature mismatch", { headerLen: sigHeader.length, computedLen: computed.length });
+      return { statusCode: 401, body: JSON.stringify({ error: "signature mismatch or missing" }) };
     }
-    if (!AXC.base || !AXC.apitoken || !AXC.wstoken) {
-      return { statusCode: 500, body: JSON.stringify({ error: "Missing aXcelerate env vars" }) };
+  } catch (e) {
+    log("signature calc error", e?.message);
+    return { statusCode: 401, body: JSON.stringify({ error: "signature error" }) };
+  }
+
+  // Extract the customer email from webhook
+  const customerEmail = pickContactEmail(dataObj);
+  if (!customerEmail) {
+    log("no customer email in payload", {
+      hasContact: !!dataObj?.contact,
+      hasContactInfo: !!dataObj?.contactInfo,
+    });
+    return { statusCode: 200, body: JSON.stringify({ info: "No customer email; nothing to do" }) };
+  }
+
+  // Build the note from the last outbound email thread
+  const outbound = latestOutboundEmailThread(dataObj);
+  const note = makeNote({ data: dataObj, outbound });
+
+  // Prepare aXcelerate headers
+  const axcHeaders = {
+    apitoken: AXC_API_TOKEN,
+    wstoken: AXC_WS_TOKEN,
+  };
+
+  // 1) Find contact by email — try search first (more reliable), then direct
+  // Search (wildcard/right-match) but we will exact-match filter in JS
+  const base = AXC_BASE_URL;
+  const tried = [];
+
+  // search by `search=` first
+  const r1 = await axcFetch(base, `/api/contacts/search?search=${encodeURIComponent(customerEmail)}&displayLength=25`, axcHeaders);
+  tried.push(r1.url);
+
+  let candidates = Array.isArray(r1.body) ? r1.body : [];
+  // If the endpoint sometimes returns wrapped objects, normalize
+  if (!Array.isArray(candidates) && Array.isArray(r1.body?.body)) candidates = r1.body.body;
+
+  // Filter exact case-insensitive matches on EMAILADDRESS
+  let found = candidates.find(c => (c.EMAILADDRESS || "").toLowerCase() === customerEmail.toLowerCase());
+
+  // fallback: direct lookup
+  if (!found) {
+    const r2 = await axcFetch(base, `/api/contacts?emailAddress=${encodeURIComponent(customerEmail)}`, axcHeaders);
+    tried.push(r2.url);
+    const body = r2.body;
+    if (Array.isArray(body) && body.length) {
+      // Many tenants return a single contact in an array
+      const exact = body.find(c => (c.EMAILADDRESS || "").toLowerCase() === customerEmail.toLowerCase());
+      found = exact || body[0];
+    } else if (body && typeof body === "object" && body.CONTACTID) {
+      found = body;
     }
-    const raw = event.body;
-    if (!raw) {
-      log("no body");
-      return { statusCode: 400, body: JSON.stringify({ error: "Missing body" }) };
-    }
+  }
 
-    let payload;
-    try { payload = JSON.parse(raw); } catch {
-      return { statusCode: 400, body: JSON.stringify({ error: "Body must be JSON" }) };
-    }
-
-    const sig = event.headers["x-td-signature"] || event.headers["X-TD-Signature"];
-    const secret = process.env.TD_WEBHOOK_SECRET;
-    const allowUnverified = String(process.env.ALLOW_UNVERIFIED_WEBHOOKS || "").toLowerCase() === "true";
-
-    if (!allowUnverified && !signatureOk(sig, secret, payload)) {
-      log("signature mismatch or missing");
-      return { statusCode: 401, body: JSON.stringify({ error: "Signature check failed" }) };
-    }
-
-    const data = payload.data || payload;
-
-    // 1) Get the recipient email (customer) from the documented field
-    const customerEmail =
-      data?.contactInfo?.email ||
-      data?.contact?.email ||
-      data?.customer?.email ||
-      data?.conversation?.contact?.email ||
-      null;
-
-    if (!customerEmail) {
-      log("no customer email in payload", {
-        hasContactInfo: !!data?.contactInfo, hasContact: !!data?.contact, hasCustomer: !!data?.customer
-      });
-      return { statusCode: 200, body: JSON.stringify({ ok: true, skipped: "No customer email present" }) };
-    }
-
-    // 2) Find the contact in aXcelerate
-    const contact = await findContactByEmail(customerEmail);
-    if (!contact?.CONTACTID) {
-      log("contact not found for email", customerEmail);
-      return { statusCode: 200, body: JSON.stringify({ ok: true, skipped: "Contact not found", email: customerEmail }) };
-    }
-
-    // 3) Build the note from the latest outbound thread (if present); otherwise fallback to subject/message
-    const threads =
-      data?.threads ||
-      data?.conversation?.threads ||
-      [];
-
-    const latestOutbound = [...threads].reverse().find(t => String(t?.direction || "").toLowerCase() === "outbound");
-
-    const subject =
-      latestOutbound?.subject ||
-      data?.subject ||
-      data?.conversation?.subject ||
-      "(no subject)";
-
-    const bodyHtml =
-      latestOutbound?.htmlBody ||
-      latestOutbound?.body ||
-      data?.message?.htmlBody ||
-      data?.message?.body ||
-      "";
-
-    const bodyText =
-      latestOutbound?.textBody ||
-      htmlToText(bodyHtml);
-
-    const inboxName = data?.inbox?.name || "";
-    const inboxAddr = data?.inbox?.connectedEmailAddress || "";
-    const convId = data?.conversation?.id || data?.id;
-
-    const note = [
-      `Email sent via ThriveDesk`,
-      subject ? `Subject: ${subject}` : null,
-      inboxName || inboxAddr ? `From: ${inboxName}${inboxAddr ? ` <${inboxAddr}>` : ""}` : null,
-      `To: ${customerEmail}`,
-      convId ? `Conversation ID: ${convId}` : null,
-      "",
-      bodyText || "(no body provided)"
-    ].filter(Boolean).join("\n");
-
-    // 4) Add the contact note in aXcelerate
-    const { ok, status, body } = await addContactNote(contact.CONTACTID, note);
-
-    if (!ok) {
-      log("aXcelerate note failed", { status, body });
-      return { statusCode: 502, body: JSON.stringify({ error: "aXcelerate note failed", status, body }) };
-    }
-
+  if (!found?.CONTACTID) {
+    log("no matching contact in aXcelerate", { customerEmail, tried });
     return {
       statusCode: 200,
-      body: JSON.stringify({
-        ok: true,
-        contactID: contact.CONTACTID,
-        email: customerEmail,
-        noteChars: note.length
-      })
+      body: JSON.stringify({ info: "No aXcelerate match; skipped", tried }),
     };
-  } catch (err) {
-    log("error", err);
-    return { statusCode: 500, body: JSON.stringify({ error: String(err?.message || err) }) };
   }
+
+  // 2) Add the contact note (PUT)
+  const putBody = {
+    contactID: found.CONTACTID,
+    contactNote: note,
+    // noteTypeID: 6444, // leave off for now per your testing
+  };
+
+  const putRes = await axcFetch(base, `/api/contact/note/`, axcHeaders, {
+    method: "PUT",
+    body: JSON.stringify(putBody),
+  });
+
+  if (!putRes.ok) {
+    log("axcelerate note PUT failed", { status: putRes.status, body: putRes.body });
+    return {
+      statusCode: 502,
+      body: JSON.stringify({ error: "aXcelerate note create failed", putRes }),
+    };
+  }
+
+  // Done
+  return {
+    statusCode: 200,
+    body: JSON.stringify({
+      ok: true,
+      contactID: found.CONTACTID,
+      email: customerEmail,
+      noteLength: note.length,
+    }),
+  };
 };
