@@ -204,7 +204,7 @@ async function addContactNote(contactID, note) {
   form.set("contactID", String(contactID));
   form.set("contactNote", note);
   return axcFetch(`/api/contact/note/`, {
-    method: "PUT",
+    method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: form.toString(),
   });
@@ -285,7 +285,7 @@ exports.handler = async (event) => {
 
     const put = await addContactNote(contact.CONTACTID, note);
     if (!put.ok) {
-      log("note PUT failed", { status: put.status, url: put.url, body: put.body });
+      log("note POST failed", { status: put.status, url: put.url, body: put.body });
       return { statusCode: 502, body: JSON.stringify({ error: "aXcelerate note create failed", status: put.status }) };
     }
 
