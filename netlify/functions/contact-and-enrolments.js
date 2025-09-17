@@ -1,206 +1,226 @@
-// netlify/functions/contact-and-enrolments.js
-// Returns:
-// {
-//   contact: <FULL AXCELERATE CONTACT OBJECT>,
-//   contactSummary: { small, handy subset },
-//   currentQualifications: [ { CODE, NAME, STATUS, ENROLMENTDATE, STARTDATE, FINISHDATE, ENROLID, INSTANCEID } ],
-//   _debug?: { tried: [...], usedUrls: [...] } // when ?debug=1
-// }
+// Netlify Function: /contact-and-enrolments
+// Fetch a contact by email (robust matching) and their PROGRAM (qualification) enrolments.
+// Env vars required:
+//   AXC_BASE_URL      e.g. https://vetnurse.app.axcelerate.com
+//   AXC_API_TOKEN
+//   AXC_WS_TOKEN
+//
+// Notes:
+// - We use /contacts/search?search=<email> because it's consistently reliable across tenants.
+// - We fetch /course/enrolments?contactID=<id>&limit=100 once, then filter TYPE === 'p' (program/qualification).
+// - Expected Completion Date (individual) is not exposed by /course/enrolments; aXcelerate docs show only
+//   ENROLMENTDATE/STARTDATE/FINISHDATE at the instance level. If aXcelerate exposes DateCompletionExpected
+//   for GET elsewhere, we can add that endpoint later; for now we leave expectedCompletionDate: null.
 
-const AXC_BASE = process.env.AXC_BASE;          // e.g. https://vetnurse.app.axcelerate.com
-const AXC_API_TOKEN = process.env.AXC_API_TOKEN;
-const AXC_WS_TOKEN = process.env.AXC_WS_TOKEN;
+const ALLOWED_ORIGINS = ['*']; // Loosen for now; tighten later if ThriveDesk needs it
 
-const jsonHeaders = {
-  "Content-Type": "application/json"
+const requiredEnv = ['AXC_BASE_URL', 'AXC_API_TOKEN', 'AXC_WS_TOKEN'];
+
+const headers = {
+  'Content-Type': 'application/json; charset=utf-8',
 };
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type"
-};
+function withCors(h) {
+  return {
+    ...h,
+    'Access-Control-Allow-Origin': ALLOWED_ORIGINS[0],
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Allow-Methods': 'GET, OPTIONS',
+  };
+}
 
-const axHeaders = () => ({
-  apitoken: AXC_API_TOKEN,
-  wstoken: AXC_WS_TOKEN
+const badRequest = (msg, extra = {}) => ({
+  statusCode: 400,
+  headers: withCors(headers),
+  body: JSON.stringify({ error: msg, ...extra }),
 });
 
-const ok = (body) => ({
+const serverError = (msg, extra = {}) => ({
+  statusCode: 500,
+  headers: withCors(headers),
+  body: JSON.stringify({ error: msg, ...extra }),
+});
+
+const notFound = (msg, extra = {}) => ({
+  statusCode: 404,
+  headers: withCors(headers),
+  body: JSON.stringify({ error: msg, ...extra }),
+});
+
+const ok = (data) => ({
   statusCode: 200,
-  headers: { ...jsonHeaders, ...corsHeaders, "Cache-Control": "no-store" },
-  body: JSON.stringify(body)
+  headers: withCors(headers),
+  body: JSON.stringify(data),
 });
 
-const bad = (statusCode, message) => ({
-  statusCode,
-  headers: { ...jsonHeaders, ...corsHeaders },
-  body: JSON.stringify({ error: message })
-});
-
-const buildURL = (base, path, params = {}) => {
-  const u = new URL(path, base);
-  Object.entries(params).forEach(([k, v]) => {
-    if (v !== undefined && v !== null && v !== "") u.searchParams.set(k, String(v));
-  });
-  return u.toString();
-};
-
-async function axGet(path, params, debug, usedUrls) {
-  const url = buildURL(AXC_BASE, path, params);
-  debug?.push({ type: "axGet", url });
-  usedUrls?.push(url);
-
-  const res = await fetch(url, { headers: axHeaders() });
-  // Some aX endpoints return 200 with empty body or [] when not found.
-  if (!res.ok) throw new Error(`aX GET ${path} failed: ${res.status}`);
-  const text = await res.text();
-  // Safely parse JSON or return blank
-  try {
-    return text ? JSON.parse(text) : null;
-  } catch {
-    return null;
+function assertEnv() {
+  const missing = requiredEnv.filter((k) => !process.env[k]);
+  if (missing.length) {
+    throw new Error(`Missing environment variables: ${missing.join(', ')}`);
   }
 }
 
-// Robust email match across primary/alt/custom fields
-function pickExactEmail(candidates, email) {
-  if (!Array.isArray(candidates)) return null;
-  const lc = (s) => (s || "").toLowerCase();
-  const e = lc(email);
-
-  const exact = candidates.find(c =>
-    [c.EMAILADDRESS, c.EMAILADDRESSALTERNATIVE, c.CUSTOMFIELD_PERSONALEMAIL]
-      .some(v => lc(v) === e)
-  );
-
-  // If no exact, prefer the ONLY result, else null
-  if (exact) return exact;
-  if (candidates.length === 1) return candidates[0];
-  return null;
+function apiHeaders() {
+  return {
+    apitoken: process.env.AXC_API_TOKEN,
+    wstoken: process.env.AXC_WS_TOKEN,
+  };
 }
 
-// Dedupe helper by a stable key
-function dedupe(arr, keyFn) {
-  const out = [];
-  const seen = new Set();
-  for (const item of arr) {
-    const key = keyFn(item);
-    if (!seen.has(key)) {
-      seen.add(key);
-      out.push(item);
-    }
+function isEmailEqual(a, b) {
+  return (a || '').trim().toLowerCase() === (b || '').trim().toLowerCase();
+}
+
+function pickContactFields(c) {
+  // Keep key identity + address/phones (no stripping)
+  return {
+    CONTACTID: c.CONTACTID,
+    USERID: c.USERID ?? null,
+    GIVENNAME: c.GIVENNAME ?? null,
+    SURNAME: c.SURNAME ?? null,
+    EMAILADDRESS: c.EMAILADDRESS ?? null,
+    EMAILADDRESSALTERNATIVE: c.EMAILADDRESSALTERNATIVE ?? null,
+    CUSTOMFIELD_PERSONALEMAIL: c.CUSTOMFIELD_PERSONALEMAIL ?? null,
+    PHONE: c.PHONE ?? null,
+    WORKPHONE: c.WORKPHONE ?? null,
+    MOBILEPHONE: c.MOBILEPHONE ?? null,
+    ADDRESS1: c.ADDRESS1 ?? null,
+    ADDRESS2: c.ADDRESS2 ?? null,
+    CITY: c.CITY ?? null,
+    STATE: c.STATE ?? null,
+    POSTCODE: c.POSTCODE ?? null,
+    COUNTRY: c.COUNTRY ?? c.SCOUNTRY ?? null,
+    // Keep a couple of useful flags/dates:
+    CONTACTACTIVE: c.CONTACTACTIVE ?? null,
+    CONTACTENTRYDATE: c.CONTACTENTRYDATE ?? null,
+    LASTUPDATED: c.LASTUPDATED ?? null,
+  };
+}
+
+function dedupeByEnrolId(items) {
+  const seen = new Map();
+  for (const it of items) {
+    const key = String(it.ENROLID ?? `${it.CODE || 'UNK'}:${it.INSTANCEID || 'UNK'}`);
+    if (!seen.has(key)) seen.set(key, it);
   }
-  return out;
+  return Array.from(seen.values());
+}
+
+function toProgramSummary(e) {
+  return {
+    ENROLID: e.ENROLID ?? null,
+    INSTANCEID: e.INSTANCEID ?? null,
+    CODE: e.CODE ?? null,
+    NAME: e.NAME ?? null,
+    STATUS: e.STATUS ?? null,
+    ENROLMENTDATE: e.ENROLMENTDATE ?? null,
+    STARTDATE: e.STARTDATE ?? null,
+    FINISHDATE: e.FINISHDATE ?? null, // graduation/withdrawal; blank until completion
+    AMOUNTPAID: e.AMOUNTPAID ?? null,
+    expectedCompletionDate: null, // Not exposed by /course/enrolments (see file comments)
+  };
+}
+
+function isCurrentStatus(status) {
+  if (!status) return false;
+  const s = String(status).toLowerCase();
+  // Exclude clearly "not current"
+  const notCurrent = ['withdrawn', 'cancelled', 'deleted', 'completed', 'finished'];
+  if (notCurrent.includes(s)) return false;
+  // Treat everything else as current (e.g., "In Progress", "Active", "Commenced", "Tentative", etc.)
+  return true;
 }
 
 exports.handler = async (event) => {
-  if (event.httpMethod === "OPTIONS") {
-    return { statusCode: 204, headers: corsHeaders };
+  if (event.httpMethod === 'OPTIONS') {
+    return {
+      statusCode: 204,
+      headers: withCors({}),
+      body: '',
+    };
   }
 
   try {
-    const url = new URL(event.rawUrl || `https://dummy${event.rawQueryString ? "?" + event.rawQueryString : ""}`);
-    const email = url.searchParams.get("email");
-    const includeDebug = url.searchParams.get("debug") === "1";
+    assertEnv();
+  } catch (err) {
+    return serverError(err.message);
+  }
 
-    if (!AXC_BASE || !AXC_API_TOKEN || !AXC_WS_TOKEN) {
-      return bad(500, "Server not configured: missing aXcelerate credentials.");
+  const { email, debug } = event.queryStringParameters || {};
+  if (!email) {
+    return badRequest('Query param "email" is required, e.g. ?email=someone%40example.com');
+  }
+
+  const base = process.env.AXC_BASE_URL.replace(/\/+$/, '');
+  const tried = [];
+  const usedUrls = [];
+
+  async function axc(pathWithQuery) {
+    const url = `${base}${pathWithQuery}`;
+    tried.push({ type: 'GET', url });
+    const res = await fetch(url, { headers: apiHeaders() });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`aXcelerate error ${res.status} for ${url} :: ${text.slice(0, 200)}`);
     }
-    if (!email) {
-      return bad(400, "Missing required query param: email");
-    }
+    usedUrls.push(url);
+    return res.json();
+  }
 
-    const _debugTried = [];
-    const _debugUsed = [];
+  try {
+    // 1) Robust contact lookup
+    const searchUrl = `/api/contacts/search?search=${encodeURIComponent(email)}&displayLength=100`;
+    const contacts = await axc(searchUrl);
 
-    // --- 1) Find contact (prefer exact match on emailAddress param) ---
-    // Use /contacts/search with emailAddress for tighter matching (supports starts-with semantics),
-    // then enforce exact match in code.
-    _debugTried.push({
-      type: "contactSearch",
-      url: buildURL(AXC_BASE, "/api/contacts/search", { emailAddress: email, displayLength: 100 })
-    });
-    const searchResults = await axGet("/api/contacts/search", { emailAddress: email, displayLength: 100 }, _debugTried, _debugUsed);
-
-    const contact = pickExactEmail(searchResults, email)
-      // If that somehow failed, try the broader 'search' param as a fallback
-      || await (async () => {
-        _debugTried.push({
-          type: "contactSearchFallback",
-          url: buildURL(AXC_BASE, "/api/contacts/search", { search: email, displayLength: 100 })
-        });
-        const alt = await axGet("/api/contacts/search", { search: email, displayLength: 100 }, _debugTried, _debugUsed);
-        return pickExactEmail(alt, email);
-      })();
+    // Find best exact match across likely fields
+    let contact =
+      contacts.find((c) => isEmailEqual(c.EMAILADDRESS, email)) ||
+      contacts.find((c) => isEmailEqual(c.EMAILADDRESSALTERNATIVE, email)) ||
+      contacts.find((c) => isEmailEqual(c.CUSTOMFIELD_PERSONALEMAIL, email)) ||
+      contacts[0];
 
     if (!contact) {
-      const body = { contact: null, currentQualifications: [] };
-      if (includeDebug) body._debug = { tried: _debugTried, usedUrls: _debugUsed };
-      return ok(body);
+      return notFound(`No contact matched email: ${email}`, debug ? { _debug: { tried, usedUrls } } : undefined);
     }
 
-    // --- 2) Program (qualification) enrolments for the contact ---
-    // Use /course/enrolments with type=p to get accredited program enrolments.
-    _debugTried.push({
-      type: "programEnrolments",
-      url: buildURL(AXC_BASE, "/api/course/enrolments", { contactID: contact.CONTACTID, type: "p", limit: 100 })
-    });
-    const enrolmentsRaw = await axGet("/api/course/enrolments", { contactID: contact.CONTACTID, type: "p", limit: 100 }, _debugTried, _debugUsed);
+    const contactOut = pickContactFields(contact);
 
-    const programRows = Array.isArray(enrolmentsRaw) ? enrolmentsRaw.filter(e => (e.TYPE || "").toLowerCase() === "p") : [];
+    // 2) Single call to enrolments, then filter to TYPE === 'p' (program/qualification)
+    const enrolUrl = `/api/course/enrolments?contactID=${encodeURIComponent(
+      String(contact.CONTACTID)
+    )}&limit=100`;
+    const enrolments = await axc(enrolUrl);
 
-    // Dedupe in case the endpoint returns duplicates (seen in some tenants)
-    const programUnique = dedupe(
-      programRows,
-      (e) => String(e.ENROLID || "") || `${e.CODE || ""}|${e.INSTANCEID || ""}`
-    );
+    // Some tenants return an array of mixed enrolments (workshops 'w' + programs 'p')
+    const programEnrols = Array.isArray(enrolments)
+      ? enrolments.filter((e) => (e.TYPE || e.type) === 'p')
+      : [];
 
-    // Shape a small summary that’s easy to map in ThriveDesk,
-    // while keeping the FULL contact object available.
-    const currentQualifications = programUnique.map(e => ({
-      CODE: e.CODE ?? null,
-      NAME: e.NAME ?? null,
-      STATUS: e.STATUS ?? null,
-      ENROLMENTDATE: e.ENROLMENTDATE ?? null,
-      STARTDATE: e.STARTDATE ?? null,
-      FINISHDATE: e.FINISHDATE ?? null, // stays null until completion/withdrawal in aX
-      ENROLID: e.ENROLID ?? e.LEARNERID ?? null,
-      INSTANCEID: e.INSTANCEID ?? null
-      // EXPECTED_COMPLETION: null // Not exposed by this list endpoint; see notes below.
-    }));
+    // Dedupe (some tenants echo dupes)
+    const deduped = dedupeByEnrolId(programEnrols).map(toProgramSummary);
 
-    // Provide a concise contact summary (handy for quick mapping),
-    // AND the full raw contact for all address/phone fields, etc.
-    const contactSummary = {
-      CONTACTID: contact.CONTACTID,
-      GIVENNAME: contact.GIVENNAME,
-      SURNAME: contact.SURNAME,
-      EMAILADDRESS: contact.EMAILADDRESS,
-      EMAILADDRESSALTERNATIVE: contact.EMAILADDRESSALTERNATIVE,
-      MOBILEPHONE: contact.MOBILEPHONE,
-      PHONE: contact.PHONE,
-      WORKPHONE: contact.WORKPHONE,
-      ADDRESS1: contact.ADDRESS1,
-      ADDRESS2: contact.ADDRESS2,
-      CITY: contact.CITY,
-      STATE: contact.STATE,
-      POSTCODE: contact.POSTCODE,
-      COUNTRY: contact.COUNTRY
-    };
+    const currentQualifications = deduped.filter((e) => isCurrentStatus(e.STATUS));
+
+    // 3) Direct link to the contact in aXcelerate console
+    // Use tenant domain from AXC_BASE_URL
+    const portalBase = base.replace(/\/api\/?$/, '');
+    const axcelerateContactUrl = `${portalBase}/management/management2/Contact_View.cfm?ContactID=${encodeURIComponent(
+      String(contact.CONTACTID)
+    )}`;
 
     const payload = {
-      // Full aX contact object so you can map ANY field in ThriveDesk now (addresses, phones, etc.)
-      contact,
-      // Small convenience subset (optional to use)
-      contactSummary,
-      currentQualifications
+      contact: contactOut,
+      currentQualifications,
+      axcelerateContactUrl,
     };
 
-    if (includeDebug) payload._debug = { tried: _debugTried, usedUrls: _debugUsed };
+    if (debug) payload._debug = { tried, usedUrls };
 
     return ok(payload);
   } catch (err) {
-    return bad(500, `Server error: ${err.message || String(err)}`);
+    return serverError('Failed to fetch data from aXcelerate', {
+      details: err.message,
+      ...(debug ? { _debug: { tried, usedUrls } } : {}),
+    });
   }
 };
