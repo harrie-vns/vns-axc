@@ -13,7 +13,7 @@ export async function handler(event) {
   const tried = [];
   const toLower = v => (v || "").toString().toLowerCase();
 
-  // 1) Find contact by email (broad -> exact match against three email fields)
+  // 1) Find contact by email (broad -> exact)
   const sUrl = `${base}/api/contacts/search?search=${encodeURIComponent(email)}&displayLength=100`;
   tried.push({ type: "contactSearch", url: sUrl });
   let list = [];
@@ -25,11 +25,10 @@ export async function handler(event) {
     return e1 === email || e2 === email || e3 === email;
   }) || null;
 
-  let enrolments = [];
-  let usedUrls = [];
-
-  const looksLikeEnrolment = obj => !!obj && typeof obj === "object" &&
-    ["STATUS","ENROLMENTID","CODE","COURSENAME","PROGRAMNAME","CLASSNAME","NAME","STARTDATE","FINISHDATE","ENROLMENTDATE","INSTANCEID","TYPE"].some(k => k in obj);
+  // helpers
+  const looksLikeEnrolment = obj =>
+    !!obj && typeof obj === "object" &&
+    ["STATUS","ENROLMENTID","CODE","NAME","STARTDATE","FINISHDATE","ENROLMENTDATE","INSTANCEID","TYPE","CONTACTID"].some(k => k in obj);
 
   const normalise = data => {
     if (Array.isArray(data)) return data;
@@ -38,20 +37,18 @@ export async function handler(event) {
     return [];
   };
 
+  let raw = [];
+  let usedUrls = [];
+
+  // 2) Pull enrolments (match Kustomer first)
   if (contact?.CONTACTID) {
     const id = contact.CONTACTID;
-
-    // 2) Match Kustomer exactly FIRST (no type param)
     const urls = [
-      `${base}/api/course/enrolments?contactID=${id}`,
-      // then useful fallbacks
-      `${base}/api/course/enrolments?contactID=${id}&limit=100`,
-      `${base}/api/course/enrolments?contactID=${id}&type=p&limit=100`,
-      `${base}/api/course/enrolments?contactID=${id}&type=w&limit=100`,
-      `${base}/api/courses/enrolments?contactID=${id}&displayLength=100`,
-      `${base}/api/enrolments/search?contactID=${id}&displayLength=100`,
-      `${base}/api/contact/enrolments?contactID=${id}&displayLength=100`,
-      `${base}/api/contact/${id}/enrolments`
+      `${base}/api/course/enrolments?contactID=${id}`,            // Kustomer used this
+      `${base}/api/course/enrolments?contactID=${id}&limit=100`,  // paging variant
+      `${base}/api/course/enrolments?contactID=${id}&type=p&limit=100`, // programs
+      `${base}/api/course/enrolments?contactID=${id}&type=w&limit=100`, // workshops (just in case)
+      `${base}/api/enrolments/search?contactID=${id}&displayLength=100` // generic fallback
     ];
 
     for (const url of urls) {
@@ -61,23 +58,35 @@ export async function handler(event) {
         if (!r.ok) continue;
         const data = await r.json();
         const arr = normalise(data).filter(looksLikeEnrolment);
-        if (arr.length) { enrolments = enrolments.concat(arr); usedUrls.push(url); }
+        if (arr.length) { raw = raw.concat(arr); usedUrls.push(url); }
       } catch {}
     }
   }
 
-  // 3) Deduplicate (by ENROLMENTID or fallback key)
-  const seen = new Set();
-  enrolments = enrolments.filter(e => {
-    const key = e.ENROLMENTID ?? `${e.INSTANCEID || ""}|${e.TYPE || ""}|${e.CONTACTID || ""}|${e.CODE || ""}`;
-    if (seen.has(key)) return false;
-    seen.add(key); return true;
-  });
+  // 3) Remove catalog noise (those have ISACTIVE/COST but no CONTACTID/ENROLID)
+  raw = raw.filter(e => e.CONTACTID || e.ENROLID);
 
-  // 4) "Current-ish" filter for convenience
-  const currentEnrolments = enrolments.filter(e => /current|active|enrolled|ongoing/i.test(String(e.STATUS || e.Status || "")));
+  // 4) Split out qualifications (TYPE 'p') vs unit enrolments (TYPE 's')
+  const qualificationEnrolments = raw.filter(e => toLower(e.TYPE) === "p");
+  const unitEnrolments = qualificationEnrolments.flatMap(q =>
+    Array.isArray(q.ACTIVITIES) ? q.ACTIVITIES.map(u => ({
+      ...u,
+      PROGRAM_CODE: q.CODE,
+      PROGRAM_NAME: q.NAME,
+      PROGRAM_INSTANCEID: q.INSTANCEID,
+      PROGRAM_ENROLID: q.ENROLID
+    })) : []
+  );
 
-  const body = { contact, enrolments, currentEnrolments };
-  if (debug) body._debug = { tried, usedUrls };
-  return { statusCode: 200, headers: { ...cors, "Content-Type": "application/json" }, body: JSON.stringify(body) };
-}
+  // 5) Current-ish qualifications
+  const currentQualifications = qualificationEnrolments.filter(e =>
+    /current|in progress|active|enrolled|ongoing/i.test(String(e.STATUS || ""))
+  );
+
+  // 6) Keep legacy fields for backward compatibility, but push the useful ones up front
+  const body = {
+    contact,
+    qualificationEnrolments,
+    currentQualifications,
+    unitEnrolments,
+    enrolments: raw // original mer
