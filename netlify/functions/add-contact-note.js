@@ -11,11 +11,10 @@ const ALLOW_UNVERIFIED =
 
 const log = (...a) => console.log("[add-contact-note]", ...a);
 
-// ---------- signature utils (unchanged) ----------
+/* ----------------- signature utils (unchanged) ----------------- */
 function hmacBase64(secret, content) {
   return crypto.createHmac("sha1", secret).update(content).digest("base64");
 }
-// robust raw extractor for body.data (works regardless of whitespace/unicode)
 function extractRawDataSubstring(bodyStr) {
   const keyIdx = bodyStr.indexOf('"data"');
   if (keyIdx < 0) return null;
@@ -45,7 +44,6 @@ function extractRawDataSubstring(bodyStr) {
   }
   return null;
 }
-
 function verifyTdSignature(event) {
   if (!TD_WEBHOOK_SECRET) return true;
   if (ALLOW_UNVERIFIED) return true;
@@ -69,13 +67,12 @@ function verifyTdSignature(event) {
   }
 
   const c3 = hmacBase64(TD_WEBHOOK_SECRET, bodyStr);
-
   const ok = [c1, c2, c3].some(sig => sig && sig === header);
   if (!ok) log("signature mismatch or missing");
   return ok;
 }
 
-// ---------- general utils ----------
+/* ----------------- general utils ----------------- */
 function htmlToText(html = "") {
   return String(html)
     .replace(/<style[\s\S]*?<\/style>|<script[\s\S]*?<\/script>/gi, "")
@@ -112,7 +109,7 @@ function lastOutboundEmailThread(data) {
   return null;
 }
 
-// ---------- aXcelerate ----------
+/* ----------------- aXcelerate helpers ----------------- */
 async function axcFetch(path, init = {}) {
   const url = `${AXC_BASE_URL}${path}`;
   const headers = {
@@ -126,10 +123,7 @@ async function axcFetch(path, init = {}) {
   try { body = text ? JSON.parse(text) : null; } catch { body = text; }
   return { ok: res.ok, status: res.status, url, body };
 }
-
 function toLower(s) { return (s || "").toString().trim().toLowerCase(); }
-
-// *** EXACT MATCH ONLY on the student's own email fields ***
 function isExactEmail(rec, targetLower) {
   return (
     (rec.EMAILADDRESS && rec.EMAILADDRESS.toLowerCase() === targetLower) ||
@@ -137,14 +131,11 @@ function isExactEmail(rec, targetLower) {
     (rec.CUSTOMFIELD_PERSONALEMAIL && rec.CUSTOMFIELD_PERSONALEMAIL.toLowerCase() === targetLower)
   );
 }
-
-// lookup with pagination + multiple search styles
 async function findContactByEmail(email) {
   const tried = [];
   const e = encodeURIComponent(email);
   const lower = toLower(email);
 
-  // 1) direct endpoint
   let r = await axcFetch(`/api/contacts?emailAddress=${e}`);
   tried.push(r.url);
   if (r.ok) {
@@ -153,7 +144,6 @@ async function findContactByEmail(email) {
     if (exact) return { contact: exact, tried };
   }
 
-  // helper: paged search up to 1000
   async function pagedExact(base) {
     let offset = 0;
     while (offset <= 900) {
@@ -169,19 +159,15 @@ async function findContactByEmail(email) {
     return null;
   }
 
-  // 2) search?emailAddress=
   let exact = await pagedExact(`/api/contacts/search?emailAddress=${e}`);
   if (exact) return { contact: exact, tried };
 
-  // 3) search?q=
   exact = await pagedExact(`/api/contacts/search?q=${e}`);
   if (exact) return { contact: exact, tried };
 
-  // 4) search?search=
   exact = await pagedExact(`/api/contacts/search?search=${e}`);
   if (exact) return { contact: exact, tried };
 
-  // 5) fallback: a page with exactly one record
   const fallbacks = [
     `/api/contacts/search?emailAddress=${e}&displayLength=1`,
     `/api/contacts/search?q=${e}&displayLength=1`,
@@ -197,7 +183,6 @@ async function findContactByEmail(email) {
 
   return { contact: null, tried };
 }
-
 async function addContactNote(contactID, note) {
   const form = new URLSearchParams();
   form.set("contactID", String(contactID));
@@ -209,7 +194,7 @@ async function addContactNote(contactID, note) {
   });
 }
 
-// ---------- handler ----------
+/* ----------------- handler ----------------- */
 exports.handler = async (event) => {
   try {
     if (event.httpMethod !== "POST") {
@@ -222,7 +207,7 @@ exports.handler = async (event) => {
       return { statusCode: 400, body: JSON.stringify({ error: "Missing body" }) };
     }
 
-    // verify signature
+    // Verify signature
     if (!verifyTdSignature(event)) {
       log("signature mismatch or missing");
       if (!ALLOW_UNVERIFIED) {
@@ -230,12 +215,14 @@ exports.handler = async (event) => {
       }
     }
 
-    // parse
+    // Parse payload AFTER signature check
     let payload;
     try { payload = JSON.parse(event.body); }
     catch { return { statusCode: 400, body: JSON.stringify({ error: "Body must be JSON" }) }; }
 
     const data = payload?.data || payload;
+
+    // Email we’re sending TO (the student/customer)
     const customerEmail = pickCustomerEmail(data);
     if (!customerEmail) {
       log("no customer email in payload", {
@@ -244,8 +231,9 @@ exports.handler = async (event) => {
       return { statusCode: 200, body: JSON.stringify({ ok: true, skipped: "no customer email" }) };
     }
 
-    // build note
+    // What we sent (subject/body) comes from the last outbound email thread
     const outbound = lastOutboundEmailThread(data);
+
     const subject =
       outbound?.subject ||
       data?.subject ||
@@ -261,21 +249,45 @@ exports.handler = async (event) => {
         ""
       );
 
-    const inboxName = data?.inbox?.name || "";
-    const inboxAddr = data?.inbox?.connectedEmailAddress || "";
+    // Agent name and the exact inbox address the student received mail from
+    const assignedTo = data?.assignedTo || data?.conversation?.assignedTo || outbound?.assignedTo || {};
+    const agentName = [assignedTo.firstName, assignedTo.lastName].filter(Boolean).join(" ").trim();
+
+    const inbox = data?.inbox || data?.conversation?.inbox || {};
+    const connectedAddr = inbox.connectedEmailAddress || inbox.inboxAddress || "";
+
+    // CC / BCC (prefer what’s on the outbound email thread)
+    const ccList = Array.isArray(outbound?.cc) ? outbound.cc
+                  : Array.isArray(data?.cc) ? data.cc
+                  : Array.isArray(data?.message?.cc) ? data.message.cc
+                  : [];
+    const bccList = Array.isArray(outbound?.bcc) ? outbound.bcc
+                   : Array.isArray(data?.bcc) ? data.bcc
+                   : Array.isArray(data?.message?.bcc) ? data.message.bcc
+                   : [];
+
+    // Conversation ID for traceability
     const convId = data?.conversation?.id || data?.ticketId || data?.id;
 
-    const note = [
-      "Email sent via ThriveDesk",
+    // Compose the note exactly as requested
+    const lines = [
+      `Email sent via ThriveDesk - Conversation ID: ${convId ?? "(unknown)"}`,
       `To: ${customerEmail}`,
-      `Subject: ${subject}`,
-      (inboxName || inboxAddr) ? `From: ${inboxName}${inboxAddr ? ` <${inboxAddr}>` : ""}` : null,
-      convId ? `Conversation ID: ${convId}` : null,
-      "",
-      plain || "(no body)"
-    ].filter(Boolean).join("\n").slice(0, 60000);
+    ];
+    if (ccList.length) lines.push(`CC: ${ccList.join(", ")}`);
+    if (bccList.length) lines.push(`BCC: ${bccList.join(", ")}`);
+    lines.push(`Subject: ${subject}`);
 
-    // find contact & add note
+    const fromBits = [];
+    if (connectedAddr) fromBits.push(connectedAddr);
+    if (agentName) fromBits.push(agentName);
+    lines.push(`From: ${fromBits.join(" - ") || "Support"}`);
+
+    lines.push("", plain || "(no body)");
+
+    const note = lines.join("\n").slice(0, 60000);
+
+    // Find aXcelerate contact & add note
     const { contact, tried } = await findContactByEmail(customerEmail);
     if (!contact?.CONTACTID) {
       log("no aXcelerate match", { customerEmail, tried });
