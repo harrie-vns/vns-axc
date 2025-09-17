@@ -2,7 +2,7 @@
 // Create a Contact Note in aXcelerate when a message/reply is sent from ThriveDesk.
 //
 // Env vars: AXC_BASE_URL, AXC_API_TOKEN, AXC_WS_TOKEN
-// Optional : TD_WEBHOOK_SECRET  (set the same value in ThriveDesk header X-Webhook-Secret)
+// Optional : TD_WEBHOOK_SECRET  (must match TD "Secret Key" and is checked via X-Webhook-Secret OR X-Secret-Key)
 
 const AXC_BASE_URL  = (process.env.AXC_BASE_URL  || "").replace(/\/+$/, "");
 const AXC_API_TOKEN = (process.env.AXC_API_TOKEN || "").trim();
@@ -12,7 +12,7 @@ const TD_SECRET     = (process.env.TD_WEBHOOK_SECRET || "").trim();
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, X-Webhook-Secret",
+  "Access-Control-Allow-Headers": "Content-Type, X-Webhook-Secret, X-Secret-Key",
   "Content-Type": "application/json"
 };
 
@@ -74,7 +74,9 @@ function extractFromThriveDesk(payload = {}) {
     get("data.conversation.customer.email", payload),
     get("conversation.customer.email", payload),
     get("conversation.contact.email", payload),
-    get("message.to_email", payload) // fallback if present
+    get("message.to_email", payload),
+    // Sometimes an array of recipients
+    (Array.isArray(get("message.to", payload)) && get("message.to", payload)[0])
   );
 
   const contactId = get("contact.id", payload) || get("customer.id", payload) ||
@@ -113,7 +115,6 @@ function extractFromThriveDesk(payload = {}) {
   const number = get("ticket.number", payload) || get("data.conversation.number", payload) || get("conversation.number", payload);
   const ticketUrl = number ? `https://app.thrivedesk.io/inbox/tickets/${number}` : undefined;
 
-  // Heuristic: only proceed for agent/outgoing messages if we can tell
   const outgoing = [
     get("message.direction", payload) === "outgoing",
     get("message.is_outgoing", payload) === true,
@@ -139,16 +140,13 @@ function buildNote({ subject, htmlBody, textBody, agent, ticketUrl }) {
 function parseBody(event) {
   const ct = (event.headers["content-type"] || event.headers["Content-Type"] || "").toLowerCase();
   let obj = {};
-  // Try JSON first
   if (ct.includes("application/json")) {
     try { obj = JSON.parse(event.body || "{}"); } catch {}
     return { obj, ct };
   }
-  // Try form-encoded
   if (ct.includes("application/x-www-form-urlencoded")) {
     const params = new URLSearchParams(event.body || "");
     const plain = Object.fromEntries(params.entries());
-    // Some services send JSON under "payload"
     if (plain.payload) {
       try { obj = JSON.parse(plain.payload); } catch { obj = plain; }
     } else {
@@ -156,7 +154,6 @@ function parseBody(event) {
     }
     return { obj, ct };
   }
-  // Fallback: attempt JSON anyway
   try { obj = JSON.parse(event.body || "{}"); } catch { obj = {}; }
   return { obj, ct };
 }
@@ -167,14 +164,20 @@ export async function handler(event) {
   if (!AXC_BASE_URL || !AXC_API_TOKEN || !AXC_WS_TOKEN) {
     return { statusCode: 500, headers: CORS, body: JSON.stringify({ error: "Missing env: AXC_BASE_URL, AXC_API_TOKEN, AXC_WS_TOKEN" }) };
   }
+
+  // --- Secret check (accept both header names) ---
   if (TD_SECRET) {
-    const got = event.headers["x-webhook-secret"] || event.headers["X-Webhook-Secret"];
-    if (got !== TD_SECRET) return { statusCode: 401, headers: CORS, body: JSON.stringify({ error: "Bad webhook secret" }) };
+    const got = event.headers["x-webhook-secret"] || event.headers["X-Webhook-Secret"]
+             || event.headers["x-secret-key"]    || event.headers["X-Secret-Key"];
+    if (got !== TD_SECRET) {
+      console.log("[add-contact-note] secret mismatch; header keys seen:", Object.keys(event.headers || {}));
+      return { statusCode: 401, headers: CORS, body: JSON.stringify({ error: "Bad webhook secret" }) };
+    }
   }
 
   const { obj: body, ct } = parseBody(event);
 
-  // Merge: accept direct JSON OR webhook-shaped payload
+  // Merge explicit JSON with TD-shaped payload
   const td = extractFromThriveDesk(body);
   const email      = pick(body.email, td.email);
   const contactId  = body.contactId || td.contactId;
@@ -185,17 +188,21 @@ export async function handler(event) {
   const ticketUrl  = pick(body.ticketUrl, td.ticketUrl);
   const noteTypeID = body.noteTypeID ?? 6444;
 
-  // Log a safe debug line to Netlify logs
-  try {
-    console.log("[add-contact-note] ct=", ct, "email=", email, "contactId=", contactId, "subject=", subject);
-  } catch {}
+  console.log("[add-contact-note] start", {
+    ct,
+    hasBody: !!event.body,
+    email,
+    contactIdProvided: contactId,
+    subjectPresent: !!subject
+  });
 
   const cid = await resolveContactId({ contactId, email });
   if (!cid) {
+    console.log("[add-contact-note] could not resolve contact", { email, contactIdProvided: contactId });
     return {
       statusCode: 404,
       headers: CORS,
-      body: JSON.stringify({ error: "Could not resolve contactID", debug: { email, contactIdProvided: contactId, contentType: ct } })
+      body: JSON.stringify({ error: "Could not resolve contactID", debug: { email, contactIdProvided: contactId } })
     };
   }
 
@@ -210,6 +217,8 @@ export async function handler(event) {
 
   const text = await res.text();
   let resp; try { resp = JSON.parse(text); } catch { resp = text; }
+
+  console.log("[add-contact-note] axc response", { status: res.status });
 
   return res.ok
     ? { statusCode: 200, headers: CORS, body: JSON.stringify({ created: true, contactId: cid, noteTypeID, usedUrl: url }) }
