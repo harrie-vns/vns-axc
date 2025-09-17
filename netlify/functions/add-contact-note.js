@@ -1,261 +1,133 @@
 // netlify/functions/add-contact-note.js
-// Create a Contact Note in aXcelerate when a message/reply is sent from ThriveDesk.
-//
-// Required env vars: AXC_BASE_URL, AXC_API_TOKEN, AXC_WS_TOKEN
-// Optional: TD_WEBHOOK_SECRET  (must match TD "Secret Key"; accepted header names: X-Webhook-Secret or X-Secret-Key)
+const crypto = require("crypto");
+const fetch = (...args) => import("node-fetch").then(({default: f}) => f(...args));
 
-const AXC_BASE_URL  = (process.env.AXC_BASE_URL  || "").replace(/\/+$/, "");
-const AXC_API_TOKEN = (process.env.AXC_API_TOKEN || "").trim();
-const AXC_WS_TOKEN  = (process.env.AXC_WS_TOKEN  || "").trim();
-const TD_SECRET     = (process.env.TD_WEBHOOK_SECRET || "").trim();
+const reqHeader = (evt, name) => evt.headers[name] || evt.headers[name.toLowerCase()] || evt.headers[name.toUpperCase()];
 
-const CORS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, X-Webhook-Secret, X-Secret-Key",
-  "Content-Type": "application/json"
+const hmacValid = (dataObj, signature, secret) => {
+  if (!signature || !secret) return false;
+  const payload = JSON.stringify(dataObj); // ThriveDesk signs ONLY the `data` object
+  const calc = crypto.createHmac("sha1", secret).update(payload).digest("base64");
+  return signature === calc;
 };
 
-const axcHeaders = () => ({ apitoken: AXC_API_TOKEN, wstoken: AXC_WS_TOKEN, json: "true" });
-const toForm = (o) =>
-  new URLSearchParams(
-    Object.entries(o)
-      .filter(([, v]) => v !== undefined && v !== null)
-      .map(([k, v]) => [k, String(v)])
-  );
+const axcHeaders = () => ({
+  apitoken: process.env.AXC_API_TOKEN,
+  wstoken: process.env.AXC_WS_TOKEN,
+});
 
-const stripHtml = (h = "") =>
-  h
-    .replace(/<style[\s\S]*?<\/style>/gi, "")
-    .replace(/<script[\s\S]*?<\/script>/gi, "")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .trim();
-
-const get = (p, o) => p.split(".").reduce((a, k) => (a && a[k] != null ? a[k] : undefined), o);
-const pick = (...vals) => vals.find((v) => typeof v === "string" && v.trim());
-
-async function axcGet(path, params = {}) {
-  const url = new URL(`${AXC_BASE_URL}${path}`);
-  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
-  const res = await fetch(url.toString(), { headers: axcHeaders() });
-  const body = await res.json().catch(() => ({}));
-  return { status: res.status, body, url: url.toString() };
-}
-
-async function resolveContactId({ contactId, email }) {
-  if (contactId) return Number(contactId);
-  if (!email) return null;
-
-  // Exact email match via /contacts
-  let r = await axcGet("/api/contacts", { emailAddress: email });
-  if (r.status === 200 && Array.isArray(r.body) && r.body.length) {
-    const exact = r.body.find(
-      (c) =>
-        (c.EMAILADDRESS || "").toLowerCase() === email.toLowerCase() ||
-        (c.CUSTOMFIELD_PERSONALEMAIL || "").toLowerCase() === email.toLowerCase()
-    );
-    if (exact) return Number(exact.CONTACTID);
+exports.handler = async (event) => {
+  if (event.httpMethod !== "POST") {
+    return { statusCode: 405, body: JSON.stringify({ error: "Use POST with JSON" }) };
   }
 
-  // Fallback: wildcard search
-  r = await axcGet("/api/contacts/search", { search: email, displayLength: 20 });
-  if (r.status === 200 && Array.isArray(r.body) && r.body.length) {
-    const exact = r.body.find(
-      (c) =>
-        (c.EMAILADDRESS || "").toLowerCase() === email.toLowerCase() ||
-        (c.CUSTOMFIELD_PERSONALEMAIL || "").toLowerCase() === email.toLowerCase()
-    );
-    if (exact) return Number(exact.CONTACTID);
+  // Parse & verify ThriveDesk signature
+  let body;
+  try { body = JSON.parse(event.body || "{}"); }
+  catch { return { statusCode: 400, body: JSON.stringify({ error: "Invalid JSON" }) }; }
+
+  const secret = process.env.TD_WEBHOOK_SECRET;
+  const signature = reqHeader(event, "x-td-signature");
+  const data = body?.data;
+
+  if (!data) {
+    return { statusCode: 400, body: JSON.stringify({ error: "Missing `data` in payload" }) };
   }
-  return null;
-}
-
-function extractFromThriveDesk(payload = {}) {
-  // Try common ThriveDesk shapes
-  const email = pick(
-    get("contact.email", payload),
-    get("customer.email", payload),
-    get("data.contact.email", payload),
-    get("data.customer.email", payload),
-    get("data.conversation.customer.email", payload),
-    get("conversation.customer.email", payload),
-    get("conversation.contact.email", payload),
-    get("message.to_email", payload),
-    (Array.isArray(get("message.to", payload)) && get("message.to", payload)[0])
-  );
-
-  const contactId =
-    get("contact.id", payload) ||
-    get("customer.id", payload) ||
-    get("data.contact.id", payload) ||
-    get("data.customer.id", payload);
-
-  const subject = pick(
-    get("ticket.subject", payload),
-    get("conversation.subject", payload),
-    get("data.conversation.subject", payload),
-    get("message.subject", payload)
-  );
-
-  const htmlBody = pick(
-    get("reply.body_html", payload),
-    get("message.body_html", payload),
-    get("data.message.body_html", payload),
-    get("data.reply.body_html", payload),
-    get("body_html", payload)
-  );
-
-  const textBody = pick(
-    get("reply.body_text", payload),
-    get("message.body_text", payload),
-    get("data.message.body_text", payload),
-    get("data.reply.body_text", payload),
-    get("body_text", payload)
-  );
-
-  const agent = pick(
-    get("user.name", payload),
-    get("agent.name", payload),
-    get("data.user.name", payload),
-    get("message.agent_name", payload)
-  );
-
-  const number =
-    get("ticket.number", payload) ||
-    get("data.conversation.number", payload) ||
-    get("conversation.number", payload);
-  const ticketUrl = number ? `https://app.thrivedesk.io/inbox/tickets/${number}` : undefined;
-
-  return { email, contactId, subject, htmlBody, textBody, agent, ticketUrl };
-}
-
-function buildNote({ subject, htmlBody, textBody, agent, ticketUrl }) {
-  const body = (textBody && textBody.trim()) || stripHtml(htmlBody || "") || "(no body)";
-  return [
-    "Email sent from ThriveDesk",
-    agent ? `Agent: ${agent}` : null,
-    subject ? `Subject: ${subject}` : null,
-    ticketUrl ? `Ticket: ${ticketUrl}` : null,
-    "",
-    body
-  ]
-    .filter(Boolean)
-    .join("\n");
-}
-
-function parseBody(event) {
-  const ct = (event.headers["content-type"] || event.headers["Content-Type"] || "").toLowerCase();
-  let obj = {};
-  if (ct.includes("application/json")) {
-    try {
-      obj = JSON.parse(event.body || "{}");
-    } catch {}
-    return { obj, ct };
-  }
-  if (ct.includes("application/x-www-form-urlencoded")) {
-    const params = new URLSearchParams(event.body || "");
-    const plain = Object.fromEntries(params.entries());
-    if (plain.payload) {
-      try {
-        obj = JSON.parse(plain.payload);
-      } catch {
-        obj = plain;
-      }
-    } else {
-      obj = plain;
-    }
-    return { obj, ct };
-  }
-  try {
-    obj = JSON.parse(event.body || "{}");
-  } catch {
-    obj = {};
-  }
-  return { obj, ct };
-}
-
-export async function handler(event) {
-  if (event.httpMethod === "OPTIONS") return { statusCode: 204, headers: CORS, body: "" };
-  if (event.httpMethod !== "POST")
-    return { statusCode: 405, headers: CORS, body: JSON.stringify({ error: "Use POST with JSON" }) };
-
-  if (!AXC_BASE_URL || !AXC_API_TOKEN || !AXC_WS_TOKEN) {
-    return {
-      statusCode: 500,
-      headers: CORS,
-      body: JSON.stringify({ error: "Missing env: AXC_BASE_URL, AXC_API_TOKEN, AXC_WS_TOKEN" })
-    };
+  if (!hmacValid(data, signature, secret)) {
+    // Return 401 so ThriveDesk retries but doesn't disable the webhook
+    return { statusCode: 401, body: JSON.stringify({ error: "Invalid signature" }) };
   }
 
-  // Accept either header name for the secret
-  if (TD_SECRET) {
-    const got =
-      event.headers["x-webhook-secret"] ||
-      event.headers["X-Webhook-Secret"] ||
-      event.headers["x-secret-key"] ||
-      event.headers["X-Secret-Key"];
-    if (got !== TD_SECRET) {
-      console.log("[add-contact-note] secret mismatch; header keys:", Object.keys(event.headers || {}));
-      return { statusCode: 401, headers: CORS, body: JSON.stringify({ error: "Bad webhook secret" }) };
+  // Pull the email address and the latest outbound email thread
+  const contactEmail =
+    data?.contact?.email ||
+    data?.contactInfo?.email ||
+    data?.inbox?.connectedEmailAddress ||
+    null;
+
+  // Prefer the most recent outbound Email thread; fallback to excerpt
+  let emailThread = null;
+  if (Array.isArray(data?.threads)) {
+    emailThread = [...data.threads]
+      .filter(t => t?.type === "Email" && (t?.direction === "Outbound" || t?.direction === "Agent"))
+      .sort((a,b) => new Date(b.createdAt) - new Date(a.createdAt))[0] || null;
+  }
+
+  const subject = data?.subject || "(no subject)";
+  const plain = emailThread?.textBody || "";
+  const html = emailThread?.htmlBody || "";
+  const noteBody =
+    `Subject: ${subject}\n\n` +
+    (plain ? plain :
+      (html ? html.replace(/<[^>]+>/g, "").replace(/\s+\n/g, "\n").trim() : data?.excerpt || ""));
+
+  // If we can't identify a recipient email, acknowledge to stop retries
+  if (!contactEmail) {
+    return { statusCode: 200, body: JSON.stringify({ ok: true, msg: "No contact email on event; nothing to do." }) };
+  }
+
+  const base = process.env.AXC_BASE_URL?.replace(/\/+$/, "");
+  if (!base || !process.env.AXC_API_TOKEN || !process.env.AXC_WS_TOKEN) {
+    return { statusCode: 500, body: JSON.stringify({ error: "Missing AXC env vars" }) };
+  }
+
+  // 1) Find the aXcelerate contact by email (try strict endpoint, then search fallback)
+  const safeEmail = encodeURIComponent(contactEmail);
+  const tryUrls = [
+    `${base}/api/contacts?emailAddress=${safeEmail}`,
+    `${base}/api/contacts/search?search=${safeEmail}&displayLength=50`
+  ];
+
+  let contact = null;
+  let lastFetch = null;
+  for (const u of tryUrls) {
+    const r = await fetch(u, { headers: axcHeaders() });
+    lastFetch = { url: u, status: r.status };
+    if (!r.ok) continue;
+    const arr = await r.json();
+    if (Array.isArray(arr) && arr.length) {
+      // Prefer exact email match if available
+      contact = arr.find(c =>
+        (c.EMAILADDRESS || c.CUSTOMFIELD_PERSONALEMAIL || "").toLowerCase() === contactEmail.toLowerCase()
+      ) || arr[0];
+      break;
     }
   }
 
-  const { obj: body, ct } = parseBody(event);
-
-  const td = extractFromThriveDesk(body);
-  const email = pick(body.email, td.email);
-  const contactId = body.contactId || td.contactId;
-  const subject = pick(body.subject, td.subject);
-  const htmlBody = pick(body.htmlBody, td.htmlBody);
-  const textBody = pick(body.textBody, td.textBody);
-  const agent = pick(body.agent, td.agent);
-  const ticketUrl = pick(body.ticketUrl, td.ticketUrl);
-
-  console.log("[add-contact-note] start", {
-    ct,
-    hasBody: !!event.body,
-    email,
-    contactIdProvided: contactId,
-    subjectPresent: !!subject
-  });
-
-  const cid = await resolveContactId({ contactId, email });
-  if (!cid) {
-    console.log("[add-contact-note] could not resolve contact", { email, contactIdProvided: contactId });
+  if (!contact?.CONTACTID) {
+    // Nothing to do, but we succeeded from webhook’s POV
     return {
-      statusCode: 404,
-      headers: CORS,
-      body: JSON.stringify({ error: "Could not resolve contactID", debug: { email, contactIdProvided: contactId } })
+      statusCode: 200,
+      body: JSON.stringify({ ok: true, msg: "No matching contact found", lastFetch })
     };
   }
 
-  const contactNote = buildNote({ subject, htmlBody, textBody, agent, ticketUrl });
+  // 2) Create the Contact Note (no noteTypeID)
+  const params = new URLSearchParams();
+  params.set("contactID", String(contact.CONTACTID));
+  params.set("contactNote", noteBody.slice(0, 60000)); // stay well below typical limits
 
-  const url = `${AXC_BASE_URL}/api/contact/note`;
-  const res = await fetch(url, {
+  const noteRes = await fetch(`${base}/api/contact/note/`, {
     method: "POST",
-    headers: { ...axcHeaders(), "Content-Type": "application/x-www-form-urlencoded" },
-    // ⛔️ noteTypeID intentionally omitted
-    body: toForm({ contactID: cid, contactNote })
+    headers: {
+      ...axcHeaders(),
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body: params
   });
 
-  const text = await res.text();
-  let resp;
-  try {
-    resp = JSON.parse(text);
-  } catch {
-    resp = text;
-  }
+  const noteText = await noteRes.text().catch(() => "");
+  const ok = noteRes.ok;
 
-  console.log("[add-contact-note] axc response", { status: res.status });
-
-  return res.ok
-    ? { statusCode: 200, headers: CORS, body: JSON.stringify({ created: true, contactId: cid, usedUrl: url }) }
-    : {
-        statusCode: res.status || 502,
-        headers: CORS,
-        body: JSON.stringify({ created: false, contactId: cid, usedUrl: url, response: resp })
-      };
-}
+  // Always return 2xx so ThriveDesk doesn't disable the webhook
+  return {
+    statusCode: ok ? 200 : 202,
+    body: JSON.stringify({
+      ok,
+      contactID: contact.CONTACTID,
+      created: ok,
+      axcStatus: noteRes.status,
+      axcBody: noteText.slice(0, 2000) // trim for logs
+    })
+  };
+};
