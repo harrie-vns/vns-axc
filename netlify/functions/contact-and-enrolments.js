@@ -1,112 +1,82 @@
 // Netlify Function: /contact-and-enrolments
-// Fetch a contact by email (robust matching) and their PROGRAM (qualification) enrolments.
-// Env vars required:
-//   AXC_BASE_URL      e.g. https://vetnurse.app.axcelerate.com
+// Fetch FULL contact + FULL qualification (program) enrolments for a given email.
+// Also returns a concise summary array for easy mapping and a direct aX contact link.
+//
+// Required env vars (set in Netlify > Site settings > Environment variables):
+//   AXC_BASE_URL   e.g. https://vetnurse.app.axcelerate.com
 //   AXC_API_TOKEN
 //   AXC_WS_TOKEN
 //
-// Notes:
-// - We use /contacts/search?search=<email> because it's consistently reliable across tenants.
-// - We fetch /course/enrolments?contactID=<id>&limit=100 once, then filter TYPE === 'p' (program/qualification).
-// - Expected Completion Date (individual) is not exposed by /course/enrolments; aXcelerate docs show only
-//   ENROLMENTDATE/STARTDATE/FINISHDATE at the instance level. If aXcelerate exposes DateCompletionExpected
-//   for GET elsewhere, we can add that endpoint later; for now we leave expectedCompletionDate: null.
+// Query:
+//   ?email=<urlencoded email>[&debug=1]
+//
+// Response shape:
+// {
+//   contact: <FULL aX contact object>,
+//   contactSummary: {...small subset...},     // convenience only
+//   currentQualifications: [ { summary fields… } ],
+//   programEnrolments: [ <FULL program enrolment objects> ],
+//   axcelerateContactUrl: "https://.../Contact_View.cfm?ContactID=...",
+//   _debug?: { tried: [...], usedUrls: [...], envSeen: {...} }
+// }
 
-const ALLOWED_ORIGINS = ['*']; // Loosen for now; tighten later if ThriveDesk needs it
+const ALLOWED_ORIGINS = ["*"];
 
-const requiredEnv = ['AXC_BASE_URL', 'AXC_API_TOKEN', 'AXC_WS_TOKEN'];
+// ---- ENV handling (with fallbacks, just in case) ----
+const AXC_BASE_URL =
+  (process.env.AXC_BASE_URL || process.env.AXC_BASE || process.env.AXC_BASEURL || "").trim();
+const AXC_API_TOKEN =
+  (process.env.AXC_API_TOKEN || process.env.apitoken || process.env.AXC_APITOKEN || "").trim();
+const AXC_WS_TOKEN =
+  (process.env.AXC_WS_TOKEN || process.env.wstoken || process.env.AXC_WSTOKEN || "").trim();
 
-const headers = {
-  'Content-Type': 'application/json; charset=utf-8',
+const baseHeaders = {
+  "Content-Type": "application/json; charset=utf-8",
 };
 
 function withCors(h) {
   return {
     ...h,
-    'Access-Control-Allow-Origin': ALLOWED_ORIGINS[0],
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-    'Access-Control-Allow-Methods': 'GET, OPTIONS',
+    "Access-Control-Allow-Origin": ALLOWED_ORIGINS[0],
+    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Cache-Control": "no-store",
   };
 }
 
-const badRequest = (msg, extra = {}) => ({
-  statusCode: 400,
-  headers: withCors(headers),
+const ok = (data) => ({ statusCode: 200, headers: withCors(baseHeaders), body: JSON.stringify(data) });
+const bad = (code, msg, extra = {}) => ({
+  statusCode: code,
+  headers: withCors(baseHeaders),
   body: JSON.stringify({ error: msg, ...extra }),
-});
-
-const serverError = (msg, extra = {}) => ({
-  statusCode: 500,
-  headers: withCors(headers),
-  body: JSON.stringify({ error: msg, ...extra }),
-});
-
-const notFound = (msg, extra = {}) => ({
-  statusCode: 404,
-  headers: withCors(headers),
-  body: JSON.stringify({ error: msg, ...extra }),
-});
-
-const ok = (data) => ({
-  statusCode: 200,
-  headers: withCors(headers),
-  body: JSON.stringify(data),
 });
 
 function assertEnv() {
-  const missing = requiredEnv.filter((k) => !process.env[k]);
-  if (missing.length) {
-    throw new Error(`Missing environment variables: ${missing.join(', ')}`);
-  }
+  const missing = [];
+  if (!AXC_BASE_URL) missing.push("AXC_BASE_URL");
+  if (!AXC_API_TOKEN) missing.push("AXC_API_TOKEN");
+  if (!AXC_WS_TOKEN) missing.push("AXC_WS_TOKEN");
+  if (missing.length) throw new Error(`Missing environment variables: ${missing.join(", ")}`);
 }
 
 function apiHeaders() {
-  return {
-    apitoken: process.env.AXC_API_TOKEN,
-    wstoken: process.env.AXC_WS_TOKEN,
-  };
+  return { apitoken: AXC_API_TOKEN, wstoken: AXC_WS_TOKEN };
 }
 
 function isEmailEqual(a, b) {
-  return (a || '').trim().toLowerCase() === (b || '').trim().toLowerCase();
-}
-
-function pickContactFields(c) {
-  // Keep key identity + address/phones (no stripping)
-  return {
-    CONTACTID: c.CONTACTID,
-    USERID: c.USERID ?? null,
-    GIVENNAME: c.GIVENNAME ?? null,
-    SURNAME: c.SURNAME ?? null,
-    EMAILADDRESS: c.EMAILADDRESS ?? null,
-    EMAILADDRESSALTERNATIVE: c.EMAILADDRESSALTERNATIVE ?? null,
-    CUSTOMFIELD_PERSONALEMAIL: c.CUSTOMFIELD_PERSONALEMAIL ?? null,
-    PHONE: c.PHONE ?? null,
-    WORKPHONE: c.WORKPHONE ?? null,
-    MOBILEPHONE: c.MOBILEPHONE ?? null,
-    ADDRESS1: c.ADDRESS1 ?? null,
-    ADDRESS2: c.ADDRESS2 ?? null,
-    CITY: c.CITY ?? null,
-    STATE: c.STATE ?? null,
-    POSTCODE: c.POSTCODE ?? null,
-    COUNTRY: c.COUNTRY ?? c.SCOUNTRY ?? null,
-    // Keep a couple of useful flags/dates:
-    CONTACTACTIVE: c.CONTACTACTIVE ?? null,
-    CONTACTENTRYDATE: c.CONTACTENTRYDATE ?? null,
-    LASTUPDATED: c.LASTUPDATED ?? null,
-  };
+  return (a || "").trim().toLowerCase() === (b || "").trim().toLowerCase();
 }
 
 function dedupeByEnrolId(items) {
   const seen = new Map();
   for (const it of items) {
-    const key = String(it.ENROLID ?? `${it.CODE || 'UNK'}:${it.INSTANCEID || 'UNK'}`);
+    const key = String(it.ENROLID ?? `${it.CODE || "UNK"}:${it.INSTANCEID || "UNK"}`);
     if (!seen.has(key)) seen.set(key, it);
   }
   return Array.from(seen.values());
 }
 
-function toProgramSummary(e) {
+function programSummary(e) {
   return {
     ENROLID: e.ENROLID ?? null,
     INSTANCEID: e.INSTANCEID ?? null,
@@ -115,112 +85,134 @@ function toProgramSummary(e) {
     STATUS: e.STATUS ?? null,
     ENROLMENTDATE: e.ENROLMENTDATE ?? null,
     STARTDATE: e.STARTDATE ?? null,
-    FINISHDATE: e.FINISHDATE ?? null, // graduation/withdrawal; blank until completion
+    FINISHDATE: e.FINISHDATE ?? null, // stays null until completion/withdrawal
     AMOUNTPAID: e.AMOUNTPAID ?? null,
-    expectedCompletionDate: null, // Not exposed by /course/enrolments (see file comments)
+    // Expected completion is not exposed by this list endpoint.
+    expectedCompletionDate: null,
   };
 }
 
 function isCurrentStatus(status) {
   if (!status) return false;
   const s = String(status).toLowerCase();
-  // Exclude clearly "not current"
-  const notCurrent = ['withdrawn', 'cancelled', 'deleted', 'completed', 'finished'];
-  if (notCurrent.includes(s)) return false;
-  // Treat everything else as current (e.g., "In Progress", "Active", "Commenced", "Tentative", etc.)
-  return true;
+  const notCurrent = ["withdrawn", "cancelled", "deleted", "completed", "finished"];
+  return !notCurrent.includes(s);
 }
 
 exports.handler = async (event) => {
-  if (event.httpMethod === 'OPTIONS') {
-    return {
-      statusCode: 204,
-      headers: withCors({}),
-      body: '',
-    };
+  if (event.httpMethod === "OPTIONS") {
+    return { statusCode: 204, headers: withCors({}), body: "" };
   }
 
   try {
     assertEnv();
   } catch (err) {
-    return serverError(err.message);
+    return bad(500, err.message);
   }
 
   const { email, debug } = event.queryStringParameters || {};
-  if (!email) {
-    return badRequest('Query param "email" is required, e.g. ?email=someone%40example.com');
-  }
+  if (!email) return bad(400, 'Query param "email" is required, e.g. ?email=someone%40example.com');
 
-  const base = process.env.AXC_BASE_URL.replace(/\/+$/, '');
+  const base = AXC_BASE_URL.replace(/\/+$/, "");
   const tried = [];
   const usedUrls = [];
 
   async function axc(pathWithQuery) {
     const url = `${base}${pathWithQuery}`;
-    tried.push({ type: 'GET', url });
+    tried.push({ type: "GET", url });
     const res = await fetch(url, { headers: apiHeaders() });
     if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      throw new Error(`aXcelerate error ${res.status} for ${url} :: ${text.slice(0, 200)}`);
+      const text = await res.text().catch(() => "");
+      throw new Error(`aXcelerate ${res.status} for ${url} :: ${text.slice(0, 300)}`);
     }
     usedUrls.push(url);
-    return res.json();
+    const txt = await res.text();
+    return txt ? JSON.parse(txt) : null;
   }
 
   try {
-    // 1) Robust contact lookup
-    const searchUrl = `/api/contacts/search?search=${encodeURIComponent(email)}&displayLength=100`;
-    const contacts = await axc(searchUrl);
+    // 1) Contact lookup — try exact email param first, then broader 'search'
+    let contacts = await axc(`/api/contacts/search?emailAddress=${encodeURIComponent(email)}&displayLength=100`);
+    if (!Array.isArray(contacts) || contacts.length === 0) {
+      contacts = await axc(`/api/contacts/search?search=${encodeURIComponent(email)}&displayLength=100`);
+    }
+    if (!Array.isArray(contacts) || contacts.length === 0) {
+      const out = { contact: null, currentQualifications: [], programEnrolments: [] };
+      if (debug) out._debug = { tried, usedUrls, envSeen: {
+        has_BASE_URL: !!AXC_BASE_URL, has_API_TOKEN: !!AXC_API_TOKEN, has_WS_TOKEN: !!AXC_WS_TOKEN } };
+      return ok(out);
+    }
 
-    // Find best exact match across likely fields
-    let contact =
+    // Choose best exact match across EMAILADDRESS / ALT / PERSONAL
+    const contact =
       contacts.find((c) => isEmailEqual(c.EMAILADDRESS, email)) ||
       contacts.find((c) => isEmailEqual(c.EMAILADDRESSALTERNATIVE, email)) ||
       contacts.find((c) => isEmailEqual(c.CUSTOMFIELD_PERSONALEMAIL, email)) ||
       contacts[0];
 
-    if (!contact) {
-      return notFound(`No contact matched email: ${email}`, debug ? { _debug: { tried, usedUrls } } : undefined);
-    }
+    // Keep FULL contact (no stripping)
+    const fullContact = contact;
 
-    const contactOut = pickContactFields(contact);
+    // 2) Enrolments (single call), filter to program TYPE 'p', de-dupe
+    const enrolments = await axc(`/api/course/enrolments?contactID=${encodeURIComponent(String(contact.CONTACTID))}&limit=100`);
+    const programRows = Array.isArray(enrolments) ? enrolments.filter((e) => (e.TYPE || e.type) === "p") : [];
+    const programUnique = dedupeByEnrolId(programRows);
 
-    // 2) Single call to enrolments, then filter to TYPE === 'p' (program/qualification)
-    const enrolUrl = `/api/course/enrolments?contactID=${encodeURIComponent(
-      String(contact.CONTACTID)
-    )}&limit=100`;
-    const enrolments = await axc(enrolUrl);
+    // FULL raw program enrolments
+    const programEnrolments = programUnique;
 
-    // Some tenants return an array of mixed enrolments (workshops 'w' + programs 'p')
-    const programEnrols = Array.isArray(enrolments)
-      ? enrolments.filter((e) => (e.TYPE || e.type) === 'p')
-      : [];
+    // Small summary & current filtering
+    const currentQualifications = programUnique.map(programSummary).filter((e) => isCurrentStatus(e.STATUS));
 
-    // Dedupe (some tenants echo dupes)
-    const deduped = dedupeByEnrolId(programEnrols).map(toProgramSummary);
+    // 3) Direct link into aXcelerate UI
+    const portalBase = base.replace(/\/api\/?$/, "");
+    const axcelerateContactUrl =
+      `${portalBase}/management/management2/Contact_View.cfm?ContactID=${encodeURIComponent(String(contact.CONTACTID))}`;
 
-    const currentQualifications = deduped.filter((e) => isCurrentStatus(e.STATUS));
-
-    // 3) Direct link to the contact in aXcelerate console
-    // Use tenant domain from AXC_BASE_URL
-    const portalBase = base.replace(/\/api\/?$/, '');
-    const axcelerateContactUrl = `${portalBase}/management/management2/Contact_View.cfm?ContactID=${encodeURIComponent(
-      String(contact.CONTACTID)
-    )}`;
+    // Optional small contact subset (you can ignore this and just use `contact.*`)
+    const contactSummary = {
+      CONTACTID: contact.CONTACTID,
+      GIVENNAME: contact.GIVENNAME,
+      SURNAME: contact.SURNAME,
+      EMAILADDRESS: contact.EMAILADDRESS || contact.CUSTOMFIELD_PERSONALEMAIL || contact.EMAILADDRESSALTERNATIVE || null,
+      MOBILEPHONE: contact.MOBILEPHONE ?? null,
+      PHONE: contact.PHONE ?? null,
+      WORKPHONE: contact.WORKPHONE ?? null,
+      ADDRESS1: contact.ADDRESS1 ?? null,
+      ADDRESS2: contact.ADDRESS2 ?? null,
+      CITY: contact.CITY ?? null,
+      STATE: contact.STATE ?? null,
+      POSTCODE: contact.POSTCODE ?? null,
+      COUNTRY: contact.COUNTRY ?? contact.SCOUNTRY ?? null,
+      CONTACT_LINK: axcelerateContactUrl,
+    };
 
     const payload = {
-      contact: contactOut,
-      currentQualifications,
+      contact: fullContact,            // FULL contact object (ALL fields)
+      contactSummary,                  // optional subset for convenience
+      currentQualifications,           // tidy summary of program enrolments
+      programEnrolments,               // FULL program enrolment objects (ALL fields)
       axcelerateContactUrl,
     };
 
-    if (debug) payload._debug = { tried, usedUrls };
+    if (debug) {
+      payload._debug = {
+        tried,
+        usedUrls,
+        envSeen: {
+          has_BASE_URL: !!AXC_BASE_URL,
+          has_API_TOKEN: !!AXC_API_TOKEN,
+          has_WS_TOKEN: !!AXC_WS_TOKEN,
+        },
+      };
+    }
 
     return ok(payload);
   } catch (err) {
-    return serverError('Failed to fetch data from aXcelerate', {
+    return bad(500, "Failed to fetch from aXcelerate", {
       details: err.message,
-      ...(debug ? { _debug: { tried, usedUrls } } : {}),
+      ...(debug ? { _debug: { tried, usedUrls, envSeen: {
+        has_BASE_URL: !!AXC_BASE_URL, has_API_TOKEN: !!AXC_API_TOKEN, has_WS_TOKEN: !!AXC_WS_TOKEN } } } : {}),
     });
   }
 };
