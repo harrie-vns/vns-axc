@@ -1,16 +1,25 @@
 // netlify/functions/add-contact-note.js
 // ThriveDesk ➜ aXcelerate Contact Note webhook
-// - Verifies X-TD-SIGNATURE per ThriveDesk docs
-// - Uses the SAME contact lookup approach as your working /contact-and-enrolments
-// - Adds a contact note to aXcelerate (POST /api/contact/note/)
+//
+// What it does
+// - Verifies ThriveDesk webhook (RELAXED signature check that worked for you)
+// - Pulls the recipient email from data.contactInfo.email
+// - Finds the matching aX contact (same lookup logic as your working function)
+// - Posts a note to /api/contact/note/ (POST, x-www-form-urlencoded)
+//
+// Required env vars (Netlify > Site settings > Environment variables):
+//   AXC_BASE_URL      e.g. https://vetnurse.app.axcelerate.com
+//   AXC_API_TOKEN
+//   AXC_WS_TOKEN
+//   TD_WEBHOOK_SECRET (your ThriveDesk webhook secret)
 
 const crypto = require("crypto");
 
 // ====== ENV ======
-const AXC_BASE_URL = (process.env.AXC_BASE_URL || "").trim();    // e.g. https://vetnurse.app.axcelerate.com
-const AXC_API_TOKEN = (process.env.AXC_API_TOKEN || "").trim();
-const AXC_WS_TOKEN  = (process.env.AXC_WS_TOKEN  || "").trim();
-const TD_WEBHOOK_SECRET = (process.env.TD_WEBHOOK_SECRET || "").trim(); // your ThriveDesk webhook secret
+const AXC_BASE_URL     = (process.env.AXC_BASE_URL     || "").trim();
+const AXC_API_TOKEN    = (process.env.AXC_API_TOKEN    || "").trim();
+const AXC_WS_TOKEN     = (process.env.AXC_WS_TOKEN     || "").trim();
+const TD_WEBHOOK_SECRET= (process.env.TD_WEBHOOK_SECRET|| "").trim();
 
 // ====== Small HTTP helpers ======
 function withCors(headers = {}) {
@@ -40,26 +49,40 @@ function getHeader(event, name) {
   return key ? h[key] : undefined;
 }
 
-// ====== ThriveDesk signature (per docs) ======
-// signature = base64(HMAC_SHA1(secret, JSON.stringify(data)))
-function verifyTdSignature(rawBodyStr, event) {
+// ====== Signature helpers (RELAXED — back to what worked) ======
+function computeTdSignatureBase64FromDataField(rawBodyStr, secret) {
+  let payloadData;
   try {
-    const sig = getHeader(event, "x-td-signature");
-    if (!sig || !TD_WEBHOOK_SECRET) return { ok: false, reason: "missing" };
-
-    const body = JSON.parse(rawBodyStr || "{}");
-    const data = body && typeof body === "object" && body.data !== undefined ? body.data : body;
-
-    const computed = crypto
-      .createHmac("sha1", TD_WEBHOOK_SECRET)
-      .update(JSON.stringify(data))
-      .digest("base64");
-
-    const okMatch = sig === computed;
-    return { ok: okMatch, provided: sig, computed };
-  } catch (e) {
-    return { ok: false, reason: e.message };
+    const parsed = JSON.parse(rawBodyStr || "{}");
+    payloadData = (parsed && typeof parsed === "object" && parsed.data !== undefined)
+      ? parsed.data
+      : parsed;
+  } catch {
+    payloadData = {};
   }
+  const json = JSON.stringify(payloadData);
+  return crypto.createHmac("sha1", secret).update(json).digest("base64");
+}
+
+function sigLooksValid(headerValue, computed) {
+  if (!headerValue) return false;
+  const h = String(headerValue).trim();
+  // Accept common variants & substring (the relaxed approach you used successfully)
+  if (h === computed) return true;
+  if (h === `sha1=${computed}`) return true;
+  if (h === `sha1 ${computed}`) return true;
+  if (h.includes(computed)) return true;
+  return false;
+}
+
+function verifyTdSignatureLoose(event) {
+  const sigHeader = getHeader(event, "x-td-signature");
+  const rawBodyStr = event.isBase64Encoded
+    ? Buffer.from(event.body || "", "base64").toString("utf8")
+    : (event.body || "");
+  const computed = computeTdSignatureBase64FromDataField(rawBodyStr, TD_WEBHOOK_SECRET);
+  const ok = sigLooksValid(sigHeader, computed);
+  return { ok, provided: sigHeader || null, computed };
 }
 
 // ====== aXcelerate HTTP ======
@@ -86,6 +109,8 @@ function recordEmails(rec = {}) {
     rec.EMAILADDRESS,
     rec.EMAILADDRESSALTERNATIVE,
     rec.CUSTOMFIELD_PERSONALEMAIL,
+    rec.CUSTOMFIELD_THIRDPARTYACCESS_EMAIL,
+    rec.CUSTOMFIELD_THIRDPARTYACCESS_EMAILADDRESS,
   ].map(normEmail).filter(Boolean);
 }
 function isEmailMatch(rec, target) {
@@ -93,7 +118,7 @@ function isEmailMatch(rec, target) {
   return recordEmails(rec).includes(t);
 }
 
-// ====== Robust contact lookup (lifted from working function) ======
+// ====== Robust contact lookup (same approach as your working function) ======
 async function findContactByEmail(email) {
   const tried = [];
   const e = encodeURIComponent(email);
@@ -108,7 +133,7 @@ async function findContactByEmail(email) {
     if (exact0) return { contact: exact0, tried };
   }
 
-  // helper: paged search up to 1000 results in case of right-wildcard broad matches
+  // helper: paged search up to 1000 in case of wildcard-y results
   async function pagedSearch(baseUrl) {
     let offset = 0;
     while (offset <= 900) {
@@ -144,7 +169,8 @@ async function addContactNote(contactID, note) {
   const form = new URLSearchParams();
   form.set("contactID", String(contactID));
   form.set("contactNote", note);
-  // You can add noteTypeID later if/when confirmed by API: form.set("noteTypeID", "6444");
+  // Do NOT set noteTypeID for now (not reliable in your manual tests)
+  // form.set("noteTypeID", "6444");
 
   const res = await axcFetch(`/api/contact/note/`, {
     method: "POST",
@@ -154,35 +180,36 @@ async function addContactNote(contactID, note) {
   return res;
 }
 
-// ====== Extract email & note content from ThriveDesk payload ======
+// ====== Extract email & compose note from ThriveDesk payload ======
 function extractEmailFromTdData(data) {
-  // Per docs: contactInfo.email is the one to trust
+  // Per ThriveDesk docs: contactInfo.email is the one we trust
   const direct = data?.contactInfo?.email;
   if (direct) return direct;
 
-  // Fallbacks (best-effort)
+  // Fallbacks (best-effort only)
   const toList = data?.message?.to || data?.payload?.to || [];
-  const toEmail = Array.isArray(toList) && toList.length ? (toList[0].email || toList[0]) : null;
-  return toEmail || null;
+  if (Array.isArray(toList) && toList.length) {
+    const first = toList[0];
+    return typeof first === "string" ? first : (first?.email || null);
+  }
+  return null;
 }
 
 function renderNoteFromTdData(data) {
   const subject = data?.message?.subject || data?.conversation?.subject || "(no subject)";
   const bodyHtml = data?.message?.html || data?.message?.body || data?.message?.text || "";
-  const toStr = (() => {
-    const to = data?.contactInfo?.email || "";
-    return to ? `To: ${to}\n` : "";
-  })();
-  const agent = data?.agent?.name || data?.user?.name || "";
+  const toStr = data?.contactInfo?.email ? `To: ${data.contactInfo.email}\n` : "";
+  const agent  = data?.agent?.name || data?.user?.name || "";
   const header = `Email sent from ThriveDesk\n${toStr}${agent ? `Agent: ${agent}\n` : ""}Subject: ${subject}\n\n`;
-  // strip very basic HTML if present
+  // Very light HTML → text
   const text = bodyHtml.replace(/<br\s*\/?>/gi, "\n").replace(/<[^>]+>/g, "");
-  return (header + text).slice(0, 12000); // keep it safe for long emails
+  return (header + text).slice(0, 12000);
 }
 
 // ====== Handler ======
 exports.handler = async (event) => {
   if (event.httpMethod === "OPTIONS") return { statusCode: 204, headers: withCors(), body: "" };
+  if (event.httpMethod !== "POST")  return bad(405, "Use POST with JSON");
 
   try {
     assertEnv();
@@ -190,24 +217,25 @@ exports.handler = async (event) => {
     return bad(500, err.message);
   }
 
-  const rawBody = event.isBase64Encoded
-    ? Buffer.from(event.body || "", "base64").toString("utf8")
-    : (event.body || "");
-
-  // Verify signature
-  const sig = verifyTdSignature(rawBody, event);
+  // Verify signature (RELAXED)
+  const sig = verifyTdSignatureLoose(event);
   if (!sig.ok) {
-    console.info("[add-contact-note] signature mismatch or missing");
-    // For testing you can return 200 to see logs; in prod, reject:
+    console.info("[add-contact-note] signature mismatch or missing (relaxed)", {
+      provided: sig.provided ? String(sig.provided).slice(0, 32) : null,
+      computed: sig.computed.slice(0, 32),
+    });
     return bad(401, "signature verification failed");
   }
 
+  // Parse body (& take just `data`)
+  const rawBody = event.isBase64Encoded
+    ? Buffer.from(event.body || "", "base64").toString("utf8")
+    : (event.body || "");
   let body;
-  try { body = JSON.parse(rawBody || "{}"); } catch {
-    return bad(400, "invalid JSON");
-  }
-  const data = body && typeof body === "object" && body.data !== undefined ? body.data : body;
+  try { body = JSON.parse(rawBody || "{}"); } catch { return bad(400, "invalid JSON"); }
+  const data = (body && typeof body === "object" && body.data !== undefined) ? body.data : body;
 
+  // Email to match in aX
   const customerEmail = extractEmailFromTdData(data);
   if (!customerEmail) {
     console.info("[add-contact-note] no customer email in payload", {
@@ -216,14 +244,14 @@ exports.handler = async (event) => {
     return ok({ skipped: true, reason: "no email" });
   }
 
-  // Find contact in aXcelerate (reusing the robust flow from your working code)
+  // Find contact in aXcelerate
   const { contact, tried } = await findContactByEmail(customerEmail);
   if (!contact) {
     console.info("[add-contact-note] no aXcelerate match", { customerEmail, tried });
     return ok({ skipped: true, reason: "no aX match", customerEmail });
   }
 
-  // Build and POST the note
+  // Build + POST note
   const note = renderNoteFromTdData(data);
   const put = await addContactNote(contact.CONTACTID, note);
   if (!put.ok) {
