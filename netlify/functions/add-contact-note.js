@@ -11,39 +11,49 @@ const ALLOW_UNVERIFIED =
 
 const log = (...a) => console.log("[add-contact-note]", ...a);
 
-/* ----------------- signature utils (unchanged) ----------------- */
+/* -------------------- signature utils (same approach that worked) -------------------- */
 function hmacBase64(secret, content) {
   return crypto.createHmac("sha1", secret).update(content).digest("base64");
 }
+// robust raw extractor for body.data (works regardless of whitespace/unicode)
 function extractRawDataSubstring(bodyStr) {
   const keyIdx = bodyStr.indexOf('"data"');
   if (keyIdx < 0) return null;
+
+  // move to colon after "data"
   let i = keyIdx + 6;
-  while (i < bodyStr.length && /\s|:/.test(bodyStr[i]) === false) i++;
-  while (i < bodyStr.length && /\s/.test(bodyStr[i])) i++;
+  while (i < bodyStr.length && bodyStr[i] !== ":") i++;
   if (bodyStr[i] !== ":") return null;
   i++;
   while (i < bodyStr.length && /\s/.test(bodyStr[i])) i++;
+
   const start = i;
   const first = bodyStr[start];
   if (first !== "{" && first !== "[") return null;
 
-  let depth = 0, inStr = false, strQuote = null, esc = false;
+  let depth = 0;
+  let inStr = false;
+  let strQuote = null;
+  let esc = false;
   for (let j = start; j < bodyStr.length; j++) {
     const ch = bodyStr[j];
+
     if (inStr) {
       if (esc) esc = false;
       else if (ch === "\\") esc = true;
       else if (ch === strQuote) { inStr = false; strQuote = null; }
       continue;
     }
+
     if (ch === '"' || ch === "'") { inStr = true; strQuote = ch; continue; }
     if (ch === "{" || ch === "[") depth++;
     else if (ch === "}" || ch === "]") depth--;
+
     if (depth === 0) return bodyStr.slice(start, j + 1);
   }
   return null;
 }
+
 function verifyTdSignature(event) {
   if (!TD_WEBHOOK_SECRET) return true;
   if (ALLOW_UNVERIFIED) return true;
@@ -57,22 +67,26 @@ function verifyTdSignature(event) {
   let payload;
   try { payload = JSON.parse(bodyStr); } catch { payload = null; }
 
+  // candidate 1: RAW "data" substring
   let c1 = null;
   const rawData = extractRawDataSubstring(bodyStr);
   if (rawData) c1 = hmacBase64(TD_WEBHOOK_SECRET, rawData);
 
+  // candidate 2: JSON.stringify(data)
   let c2 = null;
   if (payload && payload.data) {
     try { c2 = hmacBase64(TD_WEBHOOK_SECRET, JSON.stringify(payload.data)); } catch {}
   }
 
+  // candidate 3: full raw body (paranoid fallback)
   const c3 = hmacBase64(TD_WEBHOOK_SECRET, bodyStr);
+
   const ok = [c1, c2, c3].some(sig => sig && sig === header);
-  if (!ok) log("signature mismatch or missing");
+  if (!ok) log("signature mismatch or missing (relaxed)");
   return ok;
 }
 
-/* ----------------- general utils ----------------- */
+/* -------------------- helpers -------------------- */
 function htmlToText(html = "") {
   return String(html)
     .replace(/<style[\s\S]*?<\/style>|<script[\s\S]*?<\/script>/gi, "")
@@ -84,6 +98,7 @@ function htmlToText(html = "") {
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">");
 }
+
 function pickCustomerEmail(data) {
   return (
     data?.contactInfo?.email ||
@@ -93,6 +108,7 @@ function pickCustomerEmail(data) {
     null
   );
 }
+
 function lastOutboundEmailThread(data) {
   const threads = Array.isArray(data?.threads)
     ? data.threads
@@ -109,7 +125,7 @@ function lastOutboundEmailThread(data) {
   return null;
 }
 
-/* ----------------- aXcelerate helpers ----------------- */
+/* -------------------- aXcelerate -------------------- */
 async function axcFetch(path, init = {}) {
   const url = `${AXC_BASE_URL}${path}`;
   const headers = {
@@ -123,7 +139,7 @@ async function axcFetch(path, init = {}) {
   try { body = text ? JSON.parse(text) : null; } catch { body = text; }
   return { ok: res.ok, status: res.status, url, body };
 }
-function toLower(s) { return (s || "").toString().trim().toLowerCase(); }
+
 function isExactEmail(rec, targetLower) {
   return (
     (rec.EMAILADDRESS && rec.EMAILADDRESS.toLowerCase() === targetLower) ||
@@ -131,11 +147,13 @@ function isExactEmail(rec, targetLower) {
     (rec.CUSTOMFIELD_PERSONALEMAIL && rec.CUSTOMFIELD_PERSONALEMAIL.toLowerCase() === targetLower)
   );
 }
+
 async function findContactByEmail(email) {
   const tried = [];
   const e = encodeURIComponent(email);
-  const lower = toLower(email);
+  const lower = email.toLowerCase();
 
+  // 1) direct endpoint
   let r = await axcFetch(`/api/contacts?emailAddress=${e}`);
   tried.push(r.url);
   if (r.ok) {
@@ -144,45 +162,26 @@ async function findContactByEmail(email) {
     if (exact) return { contact: exact, tried };
   }
 
-  async function pagedExact(base) {
-    let offset = 0;
-    while (offset <= 900) {
-      const url = `${base}${base.includes("?") ? "&" : "?"}displayLength=100&offset=${offset}`;
-      const res = await axcFetch(url);
-      tried.push(res.url);
-      if (!res.ok || !Array.isArray(res.body) || res.body.length === 0) break;
-      const exact = res.body.find(c => isExactEmail(c, lower));
-      if (exact) return exact;
-      if (res.body.length < 100) break;
-      offset += 100;
-    }
-    return null;
+  // 2) search by emailAddress param
+  r = await axcFetch(`/api/contacts/search?emailAddress=${e}&displayLength=50`);
+  tried.push(r.url);
+  if (r.ok && Array.isArray(r.body)) {
+    const exact = r.body.find(c => isExactEmail(c, lower));
+    if (exact) return { contact: exact, tried };
+    if (r.body.length === 1) return { contact: r.body[0], tried };
   }
 
-  let exact = await pagedExact(`/api/contacts/search?emailAddress=${e}`);
-  if (exact) return { contact: exact, tried };
-
-  exact = await pagedExact(`/api/contacts/search?q=${e}`);
-  if (exact) return { contact: exact, tried };
-
-  exact = await pagedExact(`/api/contacts/search?search=${e}`);
-  if (exact) return { contact: exact, tried };
-
-  const fallbacks = [
-    `/api/contacts/search?emailAddress=${e}&displayLength=1`,
-    `/api/contacts/search?q=${e}&displayLength=1`,
-    `/api/contacts/search?search=${e}&displayLength=1`,
-  ];
-  for (const url of fallbacks) {
-    const res = await axcFetch(url);
-    tried.push(res.url);
-    if (res.ok && Array.isArray(res.body) && res.body.length === 1) {
-      return { contact: res.body[0], tried };
-    }
+  // 3) broad search
+  r = await axcFetch(`/api/contacts/search?search=${e}&displayLength=50`);
+  tried.push(r.url);
+  if (r.ok && Array.isArray(r.body)) {
+    const exact = r.body.find(c => isExactEmail(c, lower));
+    if (exact) return { contact: exact, tried };
   }
 
   return { contact: null, tried };
 }
+
 async function addContactNote(contactID, note) {
   const form = new URLSearchParams();
   form.set("contactID", String(contactID));
@@ -194,7 +193,7 @@ async function addContactNote(contactID, note) {
   });
 }
 
-/* ----------------- handler ----------------- */
+/* -------------------- handler -------------------- */
 exports.handler = async (event) => {
   try {
     if (event.httpMethod !== "POST") {
@@ -207,12 +206,9 @@ exports.handler = async (event) => {
       return { statusCode: 400, body: JSON.stringify({ error: "Missing body" }) };
     }
 
-    // Verify signature
+    // Verify signature first
     if (!verifyTdSignature(event)) {
-      log("signature mismatch or missing");
-      if (!ALLOW_UNVERIFIED) {
-        return { statusCode: 401, body: JSON.stringify({ error: "Signature check failed" }) };
-      }
+      return { statusCode: 401, body: JSON.stringify({ error: "Signature check failed" }) };
     }
 
     // Parse payload AFTER signature check
@@ -222,7 +218,7 @@ exports.handler = async (event) => {
 
     const data = payload?.data || payload;
 
-    // Email we’re sending TO (the student/customer)
+    // Email address to attach note to
     const customerEmail = pickCustomerEmail(data);
     if (!customerEmail) {
       log("no customer email in payload", {
@@ -231,80 +227,73 @@ exports.handler = async (event) => {
       return { statusCode: 200, body: JSON.stringify({ ok: true, skipped: "no customer email" }) };
     }
 
-    // What we sent (subject/body) comes from the last outbound email thread
+    // Build the note
     const outbound = lastOutboundEmailThread(data);
-
     const subject =
       outbound?.subject ||
       data?.subject ||
       data?.conversation?.subject ||
       "(no subject)";
 
-    const plain =
+    const bodyText =
       outbound?.textBody ||
       htmlToText(
         outbound?.htmlBody ||
-        data?.message?.htmlBody ||
-        data?.message?.body ||
-        ""
+          data?.message?.htmlBody ||
+          data?.message?.body ||
+          data?.body ||
+          ""
       );
 
-// Agent (assignee of the conversation)
-const assignee =
-  data?.assignedTo ||                  // top-level
-  data?.conversation?.assignedTo ||    // sometimes nested
-  null;
+    const convId = data?.conversation?.id || data?.id || data?.ticketId;
+    const inboxName = data?.inbox?.name || "";
+    const inboxAddr = data?.inbox?.connectedEmailAddress || data?.inbox?.inboxAddress || "";
 
-const agentName = assignee
-  ? [assignee.firstName, assignee.lastName].filter(Boolean).join(" ").trim()
-  : "";
+    // agent from assignment (ThriveDesk docs)
+    const agentFirst = data?.assignedTo?.firstName || "";
+    const agentLast = data?.assignedTo?.lastName || "";
+    const agentDisplay = `${agentFirst} ${agentLast}`.trim();
 
-// Inbox (name first, then fall back to connected address, else "Support")
-const inbox = data?.inbox || data?.conversation?.inbox || {};
-const inboxName = inbox.name || inbox.connectedEmailAddress || "Support";
+    // cc / bcc arrays (only if present)
+    const ccList =
+      (Array.isArray(data?.conversation?.cc) && data.conversation.cc) ||
+      (Array.isArray(data?.cc) && data.cc) ||
+      [];
+    const bccList =
+      (Array.isArray(data?.conversation?.bcc) && data.conversation.bcc) ||
+      (Array.isArray(data?.bcc) && data.bcc) ||
+      [];
 
-    // CC / BCC (prefer what’s on the outbound email thread)
-    const ccList = Array.isArray(outbound?.cc) ? outbound.cc
-                  : Array.isArray(data?.cc) ? data.cc
-                  : Array.isArray(data?.message?.cc) ? data.message.cc
-                  : [];
-    const bccList = Array.isArray(outbound?.bcc) ? outbound.bcc
-                   : Array.isArray(data?.bcc) ? data.bcc
-                   : Array.isArray(data?.message?.bcc) ? data.message.bcc
-                   : [];
+    const fromLine = [
+      inboxName || inboxAddr || "Unknown inbox",
+      agentDisplay ? `– ${agentDisplay}` : null,
+    ]
+      .filter(Boolean)
+      .join(" ");
 
-    // Conversation ID for traceability
-    const convId = data?.conversation?.id || data?.ticketId || data?.id;
-
-    // Compose the note exactly as requested
     const lines = [
-      `Email sent via ThriveDesk - Conversation ID: ${convId ?? "(unknown)"}`,
+      `Email sent via ThriveDesk – Conversation ID: ${convId ?? "(unknown)"}`,
       `To: ${customerEmail}`,
+      `Subject: ${subject}`,
+      `From: ${fromLine}`,
     ];
     if (ccList.length) lines.push(`CC: ${ccList.join(", ")}`);
     if (bccList.length) lines.push(`BCC: ${bccList.join(", ")}`);
-    lines.push(`Subject: ${subject}`);
-
-    const fromBits = [];
-    if (connectedAddr) fromBits.push(connectedAddr);
-    if (agentName) fromBits.push(agentName);
-    lines.push(`From: ${inboxName}${agentName ? ` - ${agentName}` : ""}`);
-
-    lines.push("", plain || "(no body)");
+    lines.push("", bodyText || "(no body)");
 
     const note = lines.join("\n").slice(0, 60000);
 
-    // Find aXcelerate contact & add note
+    // Find contact & add note
     const { contact, tried } = await findContactByEmail(customerEmail);
     if (!contact?.CONTACTID) {
       log("no aXcelerate match", { customerEmail, tried });
       return { statusCode: 200, body: JSON.stringify({ ok: true, skipped: "contact not found", tried }) };
     }
 
-    const put = await addContactNote(contact.CONTACTID, note);
-    if (!put.ok) {
-      log("note POST failed", { status: put.status, url: put.url, body: put.body });
-      return { statusCode: 502, body: JSON.stringify({ error: "aXcelerate note create failed", status: put.status }) };
+    const postRes = await addContactNote(contact.CONTACTID, note);
+    if (!postRes.ok) {
+      log("note POST failed", { status: postRes.status, url: postRes.url, body: postRes.body });
+      return { statusCode: 502, body: JSON.stringify({ error: "aXcelerate note create failed", status: postRes.status }) };
     }
 
     return {
