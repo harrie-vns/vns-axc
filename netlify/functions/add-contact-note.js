@@ -249,12 +249,19 @@ exports.handler = async (event) => {
         ""
       );
 
-    // Agent name and the exact inbox address the student received mail from
-    const assignedTo = data?.assignedTo || data?.conversation?.assignedTo || outbound?.assignedTo || {};
-    const agentName = [assignedTo.firstName, assignedTo.lastName].filter(Boolean).join(" ").trim();
+// Agent (assignee of the conversation)
+const assignee =
+  data?.assignedTo ||                  // top-level
+  data?.conversation?.assignedTo ||    // sometimes nested
+  null;
 
-    const inbox = data?.inbox || data?.conversation?.inbox || {};
-    const connectedAddr = inbox.connectedEmailAddress || inbox.inboxAddress || "";
+const agentName = assignee
+  ? [assignee.firstName, assignee.lastName].filter(Boolean).join(" ").trim()
+  : "";
+
+// Inbox (name first, then fall back to connected address, else "Support")
+const inbox = data?.inbox || data?.conversation?.inbox || {};
+const inboxName = inbox.name || inbox.connectedEmailAddress || "Support";
 
     // CC / BCC (prefer what’s on the outbound email thread)
     const ccList = Array.isArray(outbound?.cc) ? outbound.cc
@@ -281,7 +288,7 @@ exports.handler = async (event) => {
     const fromBits = [];
     if (connectedAddr) fromBits.push(connectedAddr);
     if (agentName) fromBits.push(agentName);
-    lines.push(`From: ${fromBits.join(" - ") || "Support"}`);
+    lines.push(`From: ${inboxName}${agentName ? ` - ${agentName}` : ""}`);
 
     lines.push("", plain || "(no body)");
 
